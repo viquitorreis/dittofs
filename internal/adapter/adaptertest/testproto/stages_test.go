@@ -6,6 +6,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/cubbit/dittofs/internal/adapter/adaptertest"
 	"github.com/cubbit/dittofs/internal/adapter/core"
 	"github.com/cubbit/dittofs/pkg/resources"
 )
@@ -501,4 +502,11 @@ func TestARefusalIsAnsweredAsItsVerdictSays(t *testing.T) {
 			t.Errorf("%s: answered %+v; want session %d, signed %v, checksummed %v, its body read back", c.name, c.r, c.session, c.signed, c.summed)
 		}
 	}
+}
+
+// The credits flow never waits: it admits what it holds credits for under any
+// context, and refuses the rest, so it has no cap to fill.
+func TestFlowConforms(t *testing.T) {
+	h := headerOf(t, Msg{Op: OpEcho, Version: 2})
+	adaptertest.FlowConformance(t, func() core.FlowControl { return newFlow() }, h, 0)
 }

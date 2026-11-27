@@ -2762,3 +2762,8 @@ func endedUnsent(t *testing.T, spans *tracetest.SpanRecorder, requests int) {
 		t.Errorf("%d request spans ended, want %d", n, requests)
 	}
 }
+
+// The default flow is a cap of 64 that conforms to what core asks of a flow.
+func TestCapConforms(t *testing.T) {
+	adaptertest.FlowConformance(t, core.NewCapped, nil, 64)
+}

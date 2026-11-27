@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/cubbit/dittofs/internal/adapter/adaptertest"
 	"github.com/cubbit/dittofs/internal/adapter/core"
 	"github.com/cubbit/dittofs/internal/adapter/nfs/wire"
 	"github.com/cubbit/dittofs/internal/prof"
@@ -786,4 +787,11 @@ func TestRoutingASequenceCompoundAllocatesOneRequest(t *testing.T) {
 	}); n != 1 {
 		t.Errorf("routing a SEQUENCE COMPOUND allocates %v per call, want 1", n)
 	}
+}
+
+// The flow keeps its cap of requests in flight and answers an ended context at
+// once (RFC 20 section 6.3).
+func TestTheFlowConforms(t *testing.T) {
+	newFlow := func() core.FlowControl { return NewFlow(nil) }
+	adaptertest.FlowConformance(t, newFlow, header{}, 64) // the cap's number, not flowCap
 }
