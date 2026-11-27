@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net/netip"
 	"reflect"
@@ -43,6 +44,7 @@ type replayShape struct {
 	mem  *memory.Service
 	ts   *protocol.Tables
 	reg  *protocol.Sessions // the node's sessions, which the protocol and its flows share
+	b    *resources.Budgets // the server's budgets, which a test may size before it starts
 	wrap func(core.Protocol) core.Protocol
 }
 
@@ -103,7 +105,7 @@ func replaying(
 
 	s := &replayShape{
 		t: t, mem: mem, ts: &ts,
-		reg: h.Sessions,
+		reg: h.Sessions, b: d.Budgets,
 	}
 	if shape != nil {
 		shape(s)
@@ -1555,7 +1557,15 @@ func sequenceStatus(t *testing.T, rep nfsclient.Reply) uint32 {
 func newSession(t *testing.T, reg *protocol.Sessions) *protocol.Session {
 	t.Helper()
 
-	sess, err := reg.Create(1, protocol.Spec{Fore: protocol.Channel{
+	return newSessionUnder(t, reg, false)
+}
+
+// newSessionUnder is newSession, whose client's record is SP4_MACH_CRED where
+// protect is set.
+func newSessionUnder(t *testing.T, reg *protocol.Sessions, protect bool) *protocol.Session {
+	t.Helper()
+
+	sess, err := reg.Create(1, protocol.Spec{Protect: protect, Fore: protocol.Channel{
 		Slots: 2, MaxRequest: 1 << 20, MaxResponse: 1 << 20, MaxCached: 4096, MaxOps: 8,
 	}})
 	if err != nil {
@@ -1803,12 +1813,13 @@ func TestARetryOfAnUncachedRequestIsAnsweredSequenceOKThenRetryUncached(t *testi
 	for _, tc := range []struct {
 		name    string
 		ops     []uint32
+		code    uint32 // the second result's operation code; unread when ops is empty
 		member  uint32 // the second result's status; unread when ops is empty
 		creates int
 	}{
-		{"SEQUENCE alone", nil, 0, 0},
-		{"a member that changes state", []uint32{opAccess}, retryUncached, 1},
-		{"an undefined operation", []uint32{0x7fff}, opIllegalCode, 0},
+		{"SEQUENCE alone", nil, 0, 0, 0},
+		{"a member that changes state", []uint32{opAccess}, opAccess, retryUncached, 1},
+		{"an undefined operation", []uint32{0x7fff}, opIllegalCode, opIllegalCode, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var reg *protocol.Sessions
@@ -1839,8 +1850,20 @@ func TestARetryOfAnUncachedRequestIsAnsweredSequenceOKThenRetryUncached(t *testi
 					t.Fatalf("the resend of SEQUENCE alone holds %d bytes, want %d",
 						len(rep.Body), sequenceOnly)
 				}
-			} else if got := memberStatus(t, rep); got != tc.member {
-				t.Errorf("the resend's member answered %d, want %d", got, tc.member)
+			} else {
+				if len(rep.Body) < sequenceOnly+4 {
+					t.Fatalf("the resend holds %d bytes, no second result after the %d of SEQUENCE",
+						len(rep.Body), sequenceOnly)
+				}
+
+				if got := binary.BigEndian.Uint32(rep.Body[sequenceOnly:]); got != tc.code {
+					t.Errorf("the resend's second result is for operation %d, want %d",
+						got, tc.code)
+				}
+
+				if got := memberStatus(t, rep); got != tc.member {
+					t.Errorf("the resend's member answered %d, want %d", got, tc.member)
+				}
 			}
 
 			wantCreates(t, "the retried compound", mem, tc.creates)
@@ -1854,6 +1877,321 @@ func TestARetryOfAnUncachedRequestIsAnsweredSequenceOKThenRetryUncached(t *testi
 				t.Errorf("the next sequence answered %d, want NFS4_OK", got)
 			}
 		})
+	}
+}
+
+// closingProtocol wraps the protocol so each connection's OnClose runs when its
+// first request is admitted: the close has begun, as it has for a request still
+// running when the teardown's grace ends, and the request that follows runs
+// beside it.
+type closingProtocol struct{ core.Protocol }
+
+func (p closingProtocol) NewConn(c *core.Conn) core.Stages {
+	st := p.Protocol.NewConn(c)
+	st.Flow = closingFlow{FlowControl: st.Flow, onClose: st.OnClose}
+
+	return st
+}
+
+// closingFlow runs onClose before its first Admit.
+type closingFlow struct {
+	core.FlowControl
+	onClose func(context.Context)
+}
+
+func (f closingFlow) Admit(ctx context.Context, h core.Header) (func(), error) {
+	f.onClose(ctx)
+
+	return f.FlowControl.Admit(ctx, h)
+}
+
+// A SEQUENCE that runs on a connection whose close has begun, its list closed,
+// binds nothing and is refused as not bound: the session never lists a
+// connection that is gone, which no close would take off it again, and the
+// refusal leaves the slot as it was (RFC 21 section 3.4).
+func TestASequenceOnAClosingConnectionBindsNothing(t *testing.T) {
+	const connNotBound = 10055
+
+	var reg *protocol.Sessions
+
+	_, _, srv := replaying(t, allVersions, func(s *replayShape) {
+		reg = s.reg
+		s.wrap = func(p core.Protocol) core.Protocol { return closingProtocol{p} }
+	})
+	sess := newSession(t, reg)
+	c := client(t, serving(t, srv))
+
+	rep, err := c.Do(within(t), sessionCall(sess, 1, 0, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := sequenceStatus(t, rep); got != connNotBound {
+		t.Errorf("SEQUENCE on the closing connection answered %d, want %d", got, connNotBound)
+	}
+
+	if got := reg.Conns(sess); got != 0 {
+		t.Errorf("the session lists %d connections, want none", got)
+	}
+
+	if st := sess.Check(0, 1, 0, nil); st != protocol.SlotNew {
+		t.Errorf("the slot says %v for the refused sequence ID, want %v", st, protocol.SlotNew)
+	}
+}
+
+// A SEQUENCE refused because its connection is not bound to a session whose
+// client's record is SP4_MACH_CRED leaves its slot as it was, though the reply
+// is stored: the slot's next check is a new request, where a slot that took the
+// refused sequence ID would answer the client's resend, once it binds, the same
+// refusal for ever (RFC 8881 section 2.10.6.1.2).
+func TestARefusedSequenceLeavesItsSlot(t *testing.T) {
+	const connNotBound = 10055
+
+	var reg *protocol.Sessions
+
+	_, _, srv := replaying(t, allVersions, func(s *replayShape) { reg = s.reg })
+	sess := newSessionUnder(t, reg, true)
+	c := client(t, serving(t, srv))
+
+	for range 2 {
+		rep, err := c.Do(within(t), sessionCall(sess, 1, 0, true))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got := sequenceStatus(t, rep); got != connNotBound {
+			t.Errorf("SEQUENCE on the unbound connection answered %d, want %d", got, connNotBound)
+		}
+
+		if st := sess.Check(0, 1, 0, nil); st != protocol.SlotNew {
+			t.Errorf("the slot says %v for the refused sequence ID, want %v", st, protocol.SlotNew)
+		}
+
+		if got := reg.Conns(sess); got != 0 {
+			t.Errorf("the refused SEQUENCE bound %d connections, want none", got)
+		}
+	}
+}
+
+// A SEQUENCE on a connection binds it to the session, and the connection's
+// close takes it off again: 64 connections bound and closed leave the fore
+// channel empty, where a closed connection kept on it would stay until the
+// client's lease ends (RFC 21 section 3.4).
+func TestAClosedConnectionLeavesItsSessionsForeChannel(t *testing.T) {
+	const conns = 64
+
+	var reg *protocol.Sessions
+
+	_, _, srv := replaying(t, allVersions, func(s *replayShape) {
+		reg = s.reg
+		// 64 connections hold their buffers.
+		s.b.Connection = resources.NewBudget("connection", 16<<20)
+	})
+	sess := newSession(t, reg)
+	addr := serving(t, srv)
+
+	clients := make([]*nfsclient.Client, conns)
+
+	for i := range clients {
+		clients[i] = client(t, addr)
+
+		rep, err := clients[i].Do(within(t), sessionCall(sess, uint32(i+1), 0, false))
+		if err != nil {
+			t.Fatalf("connection %d: %v", i, err)
+		}
+
+		if got := sequenceStatus(t, rep); got != 0 {
+			t.Fatalf("sequence %d answered %d, want NFS4_OK", i+1, got)
+		}
+	}
+
+	if got := reg.Conns(sess); got != conns {
+		t.Fatalf("the fore channel holds %d connections, want %d", got, conns)
+	}
+
+	for _, c := range clients {
+		if err := c.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for reg.Conns(sess) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the fore channel still holds %d connections after every close, want none",
+				reg.Conns(sess))
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestASlotBeyondTheTableIsRefusedWithoutHarm sends SEQUENCE with a slot ID the
+// session's table does not have, which a client may send (RFC 8881 section
+// 18.46.3 answers NFS4ERR_BADSLOT): the server must answer it and stay up, on a
+// bound connection and, under SP4_MACH_CRED, on an unbound one and on a
+// closing one, where the answer is NFS4ERR_CONN_NOT_BOUND_TO_SESSION and
+// slot 0 is left as it was.
+func TestASlotBeyondTheTableIsRefusedWithoutHarm(t *testing.T) {
+	const (
+		badSlot      = 10053
+		connNotBound = 10055
+	)
+
+	cases := []struct {
+		name    string
+		protect bool
+		closing bool
+		want    uint32
+	}{
+		{"bound", false, false, badSlot},
+		{"unbound under MACH_CRED", true, false, connNotBound},
+		{"closing", false, true, connNotBound},
+	}
+
+	for _, tc := range cases {
+		for _, slot := range []uint32{99, 0xFFFFFFFF} {
+			t.Run(fmt.Sprintf("%s/%#x", tc.name, slot), func(t *testing.T) {
+				var reg *protocol.Sessions
+
+				_, _, srv := replaying(t, allVersions, func(s *replayShape) {
+					reg = s.reg
+					if tc.closing {
+						s.wrap = func(p core.Protocol) core.Protocol { return closingProtocol{p} }
+					}
+				})
+				sess := newSessionUnder(t, reg, tc.protect)
+				c := client(t, serving(t, srv))
+
+				for range 2 {
+					rep, err := c.Do(within(t), sessionCall(sess, 1, slot, true))
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					if got := sequenceStatus(t, rep); got != tc.want {
+						t.Errorf("SEQUENCE on slot %#x answered %d, want %d", slot, got, tc.want)
+					}
+				}
+
+				if st := sess.Check(0, 1, 0, nil); st != protocol.SlotNew {
+					t.Errorf("slot 0 says %v after the refusals, want %v", st, protocol.SlotNew)
+				}
+			})
+		}
+	}
+}
+
+// TestSequenceIsServedWhileTheServerDrains runs the real v4 table under a
+// drain begun while a request still runs: SEQUENCE alone is served. It catches
+// a SEQUENCE row without the context role, which would make every request of a
+// draining session fail.
+func TestSequenceIsServedWhileTheServerDrains(t *testing.T) {
+	const opBlock = 59
+
+	entered, release := make(chan struct{}), make(chan struct{})
+
+	var once, released sync.Once
+
+	var reg *protocol.Sessions
+
+	_, _, srv := replaying(t, allVersions, func(s *replayShape) {
+		reg = s.reg
+		row := core.Row[void, void](opBlock, "block", core.NeedsNothing,
+			func(ctx context.Context, _ *core.Request, _ void) (void, error) {
+				once.Do(func() { close(entered) })
+
+				select {
+				case <-release:
+				case <-ctx.Done():
+				}
+
+				return void{}, nil
+			})
+		row.Versions = core.Range{First: 0, Last: 2}
+		s.member(opBlock, row)
+	})
+	sess := newSession(t, reg)
+	addr := serving(t, srv)
+	c, running := client(t, addr), client(t, addr)
+
+	go func() { _, _ = running.Do(context.Background(), sessionCall(sess, 1, 0, false, opBlock)) }()
+
+	// The running request is held until the end, so a t.Fatal below still
+	// frees it and lets Stop return.
+	defer released.Do(func() { close(release) })
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the blocking member never began")
+	}
+
+	stopped := make(chan error, 1)
+
+	go func() { stopped <- srv.Stop(context.Background()) }()
+
+	ctx := within(t)
+
+	for srv.Health().State != adapter.StateDraining {
+		select {
+		case <-ctx.Done():
+			t.Fatal("the server never began to drain")
+		case <-time.After(time.Millisecond):
+		}
+	}
+
+	rep, err := c.Do(ctx, sessionCall(sess, 1, 1, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := sequenceStatus(t, rep); got != 0 {
+		t.Errorf("SEQUENCE under the drain answered %d, want NFS4_OK", got)
+	}
+
+	released.Do(func() { close(release) })
+
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestASecondSequenceInTheRetryOfAnUncachedRequestIsMisplaced pins what a
+// SEQUENCE after the first answers on the resend of a request whose reply was
+// not kept: its own NFS4ERR_SEQUENCE_POS, which RFC 8881 section 2.10.6.1.3
+// allows, and not RETRY_UNCACHED_REP.
+func TestASecondSequenceInTheRetryOfAnUncachedRequestIsMisplaced(t *testing.T) {
+	const sequencePos = 10064
+
+	var reg *protocol.Sessions
+
+	_, _, srv := replaying(t, allVersions, func(s *replayShape) { reg = s.reg })
+	sess := newSession(t, reg)
+	c := client(t, serving(t, srv))
+
+	call := sessionCall(sess, 1, 0, false)
+	binary.BigEndian.PutUint32(call.Args[8:], 2)
+	call.Args = append(call.Args, words(opSequence)...)
+	call.Args = append(call.Args, sess.ID[:]...)
+	call.Args = append(call.Args, words(1, 0, 0, 0)...)
+
+	xid := uint32(43)
+	call.XID = &xid
+
+	for i := range 2 {
+		rep, err := c.Do(within(t), call)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got := sequenceStatus(t, rep); got != 0 {
+			t.Errorf("send %d: SEQUENCE answered %d, want NFS4_OK", i, got)
+		}
+
+		if got := memberStatus(t, rep); got != sequencePos {
+			t.Errorf("send %d: the second SEQUENCE answered %d, want %d", i, got, sequencePos)
+		}
 	}
 }
 

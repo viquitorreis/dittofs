@@ -341,26 +341,13 @@ func (b *BackChannel) Unbind(c *core.Conn) (last bool) {
 // bound, under its own mutex: the one place a close and a bind meet (RFC 21
 // section 3.4's list). The zero value is an open, empty list.
 //
-// decision: nothing calls Close, nor Unbind on the back channels, when a
-// connection ends: no OnClose stage is set yet, so a closed connection stays on
-// the sessions it was bound to until the client's lease ends and EndClient
-// drops them. Wiring the stage needs a registry call that takes the connection
-// off each session and back channel, which the code that serves a connection's
-// bind after SEQUENCE adds. Overturned by that code.
+// decision: the back channels' Unbind is not called when a connection ends,
+// which the code that serves a back channel's connection adds. Overturned by
+// that code.
 type Bound struct {
 	mu     sync.Mutex
 	closed bool
 	ids    []SessionID
-}
-
-// Close marks the list closed, so a bind after it binds nothing: the first
-// step of the connection's close.
-func (b *Bound) Close() {
-	b.mu.Lock()
-
-	defer b.mu.Unlock()
-
-	b.closed = true
 }
 
 // IDs is the sessions the connection is bound to, in the order bound.
@@ -567,7 +554,8 @@ func (s *Sessions) Holds(cl vfs.ClientID) bool {
 }
 
 // Bind binds the connection b to sess's fore channel, listing sess on it,
-// and reports whether it did: not on a closed list, nor on an ended session.
+// and reports whether it did: not on a closed list, nor on an ended session. A
+// connection already listed on it stays listed once.
 // The connection's mutex is taken before the registry's, the order End keeps.
 func (s *Sessions) Bind(sess *Session, b *Bound) bool {
 	b.mu.Lock()
@@ -586,10 +574,54 @@ func (s *Sessions) Bind(sess *Session, b *Bound) bool {
 		return false
 	}
 
+	if slices.Contains(b.ids, sess.ID) {
+		return true
+	}
+
 	b.ids = append(b.ids, sess.ID)
 	sess.conns = append(sess.conns, b)
 
 	return true
+}
+
+// Unbound is the connection b's close, the one place a list is closed: it
+// closes b's list, so a bind after it binds nothing, and takes b off the fore
+// channel of each session it listed. The connection's mutex is taken before the
+// registry's, as Bind does.
+func (s *Sessions) Unbound(b *Bound) {
+	b.mu.Lock()
+
+	defer b.mu.Unlock()
+
+	b.closed = true
+
+	s.mu.Lock()
+
+	defer s.mu.Unlock()
+
+	for _, id := range b.ids {
+		if sess, ok := s.sessions[id]; ok {
+			sess.conns = slices.DeleteFunc(sess.conns, func(o *Bound) bool {
+				return o == b
+			})
+		}
+	}
+
+	b.ids = nil
+}
+
+// Conns is the number of connections bound to sess's fore channel.
+//
+// decision: it has no caller in production: the tests of this package and of
+// the NFS adapter read it to see a closed connection leave its sessions, and
+// the second cannot reach a method in an export_test.go. Overturned if a test
+// can read the list another way, or a metric reports it.
+func (s *Sessions) Conns(sess *Session) int {
+	s.mu.Lock()
+
+	defer s.mu.Unlock()
+
+	return len(sess.conns)
 }
 
 // End ends the session id names, returns its charge and takes its ID off the

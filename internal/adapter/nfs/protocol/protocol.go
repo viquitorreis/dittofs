@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"context"
+
 	"github.com/cubbit/dittofs/internal/adapter/core"
 	"github.com/cubbit/dittofs/internal/adapter/nfs/wire"
 	"github.com/cubbit/dittofs/pkg/adapter/settings"
@@ -63,6 +65,12 @@ func (p *Protocol) NewConn(c *core.Conn) core.Stages {
 	st := core.Stages{Header: s, Router: s, Errors: p.errs, Protocol: "nfs3", Flow: NewFlow(p.reg)}
 	if p.cache != nil {
 		st.Replay = &replayStage{stage: s, cache: p.cache}
+	}
+
+	if s.bound != nil && p.reg != nil {
+		st.OnClose = func(context.Context) {
+			p.reg.Unbound(s.bound)
+		}
 	}
 
 	return st

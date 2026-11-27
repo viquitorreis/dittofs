@@ -1112,7 +1112,7 @@ func TestCreateSessionClosedList(t *testing.T) {
 	cl, seq := n.propose(t, plain(rn), "c1")
 
 	closed := new(protocol.Bound)
-	closed.Close()
+	n.sessions.Unbound(closed)
 
 	got := n.createOn(t, request(plain(rn), closed), plainAsk(cl, seq), builds)
 	wantCreated(t, got)
