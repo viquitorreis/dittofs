@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"github.com/cubbit/dittofs/internal/adapter/core"
+	"github.com/cubbit/dittofs/pkg/resources"
 	"github.com/cubbit/dittofs/pkg/vfs"
 )
 
@@ -26,6 +27,20 @@ type State struct {
 	// Bound is the connection's list of bound sessions, shared by every
 	// COMPOUND on it; nil where the state was built without a connection.
 	Bound *Bound
+
+	// What Route read of a call of minor version 1 or more whose first
+	// operation is SEQUENCE, for that operation's member to judge: whether the
+	// compound opens with it, the caller's key and the buffer holding the slot's
+	// mark, the two the reply cache keeps the slot by (RFC 21 section 3.1).
+	SeqFirst bool
+	SeqKey   uint64
+	SeqOwner *resources.Buf
+
+	// Uncached is set by SEQUENCE when the compound is the retry of a request
+	// whose reply the slot did not keep: every member after it is answered
+	// NFS4ERR_RETRY_UNCACHED_REP, or refused as its row would, and runs nothing
+	// (RFC 8881 section 2.10.6.1.3).
+	Uncached bool
 }
 
 // Current is a current filehandle and the current stateid beside it (RFC 8881

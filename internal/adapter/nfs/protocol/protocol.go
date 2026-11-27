@@ -35,6 +35,7 @@ type Protocol struct {
 // node's sessions, whose slots answer a SEQUENCE's retries; nil: none.
 func New(t Tables, b *resources.Budgets, reg *Sessions) *Protocol {
 	p := &Protocol{tables: t, errs: newErrors(), reg: reg}
+	refuseAfterUncached(t.V4)
 	if b != nil && b.Reply != nil {
 		p.cache = newReplayCache(resources.NewBufPool(b.Reply))
 	}

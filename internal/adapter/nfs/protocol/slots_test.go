@@ -12,6 +12,7 @@ import (
 	"github.com/cubbit/dittofs/internal/prof"
 	"github.com/cubbit/dittofs/pkg/adapter/settings"
 	"github.com/cubbit/dittofs/pkg/resources"
+	"github.com/cubbit/dittofs/pkg/vfs"
 )
 
 // slotted is a node with one session of fore slots caching 64 bytes a reply,
@@ -241,6 +242,33 @@ func TestAReleaseWithoutStoreFreesTheSlot(t *testing.T) {
 
 	if st := s.sess.Check(1, 1, s.keyOf(h), nil); st != SlotNew {
 		t.Errorf("after the release the retransmission is %v, want %v", st, SlotNew)
+	}
+}
+
+// Under SP4_MACH_CRED a cached reply is answered to the connection the session
+// is bound to alone: on another, the lookup answers nothing, so the SEQUENCE
+// member refuses it as not bound, and the slot's reply stays for the bound
+// connection (RFC 8881 section 18.46.3).
+func TestACachedReplyIsNotAnsweredOnAnUnboundConnectionUnderMachCred(t *testing.T) {
+	s := newSlotted(t)
+	s.sess.Protect = true
+	s.w.bound = new(Bound)
+
+	h, rel := s.admit(s.call(0x10, 1, 0, true, 1000))
+	s.w.Store(h, &resources.Buf{B: replyOf(0x10, "first")})
+	rel()
+
+	resend := headOf(s.call(0x11, 1, 0, true, 1000))
+	if got := s.hit(resend); got != nil {
+		t.Errorf("a resend on an unbound connection is answered %q, want nothing", got)
+	}
+
+	if !s.reg.Bind(s.sess, s.w.bound) {
+		t.Fatal("the connection is not bound")
+	}
+
+	if got, want := s.hit(resend), replyOf(0x11, "first"); !bytes.Equal(got, want) {
+		t.Errorf("a resend on the bound connection is answered %q, want %q", got, want)
 	}
 }
 
@@ -666,5 +694,96 @@ func TestSlotPathsAllocateNothing(t *testing.T) {
 		if n := testing.AllocsPerRun(200, f); n != 0 {
 			t.Errorf("%s allocates %v per call", name, n)
 		}
+	}
+}
+
+// Route gives a COMPOUND of minor version 1 whose first operation is SEQUENCE
+// what that operation's member judges and the call's session and client, and
+// starts it negotiated; one of minor version 0 starts at the session level and
+// reads no SEQUENCE; a session the node does not hold leaves the call's
+// session and client zero (RFC 21 sections 3.1 and 11.5).
+func TestRouteReadsTheSequenceAndStartsTheLevel(t *testing.T) {
+	s := newSlotted(t)
+	s.w.conn = nil // a bare connection panics where Route establishes it
+
+	h := headOf(s.call(1, 1, 0, false, 1000))
+
+	_, r, err := s.w.Route(h, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	st := r.State.(*State)
+
+	if r.Level != core.NeedsNegotiated {
+		t.Errorf("the level is %d, want negotiated %d", r.Level, core.NeedsNegotiated)
+	}
+
+	if r.Call.Session != s.sess.Ref || r.Call.Client != s.sess.Client {
+		t.Errorf("the call's session and client are %v and %v, want %v and %v",
+			r.Call.Session, r.Call.Client, s.sess.Ref, s.sess.Client)
+	}
+
+	if !st.SeqFirst || st.SeqKey != callerKey(h) || st.SeqOwner != h.(header).rec {
+		t.Errorf("the state holds %v, %d and %p, want true, the caller's key and the record",
+			st.SeqFirst, st.SeqKey, st.SeqOwner)
+	}
+
+	gone := s.call(2, 1, 0, false, 1000)
+	copy(gone[len(gone)-32:], make([]byte, 16))
+
+	_, r, err = s.w.Route(headOf(gone), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if r.Call.Session != (vfs.SessionRef{}) || r.Call.Client != 0 || !r.State.(*State).SeqFirst {
+		t.Errorf("a session the node lacks left the call %v and %v", r.Call.Session, r.Call.Client)
+	}
+
+	zero := stageOf(settings.VersionRange{Min: "3", Max: "4.2"})
+	body := nullCall(
+		wire.ProgNFS,
+		wire.VersNFS4,
+		wire.ProcCompound,
+		wire.AuthNone,
+		nil,
+		wire.AuthNone,
+		nil,
+		binary.BigEndian.AppendUint32(
+			binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, 0), 0),
+			0,
+		),
+	)
+
+	_, r, err = zero.Route(headOf(body), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if r.Level != core.NeedsSession || r.State.(*State).SeqFirst {
+		t.Errorf("minor 0 starts at level %d with SeqFirst %v, want the session level and false",
+			r.Level, r.State.(*State).SeqFirst)
+	}
+}
+
+// Routing a COMPOUND that opens with SEQUENCE stays at the one allocation a
+// COMPOUND's request and state take, the session lookup and the key included.
+func TestRoutingASequenceCompoundAllocatesOneRequest(t *testing.T) {
+	if prof.RaceEnabled {
+		t.Skip("the allocation count says nothing under the detector")
+	}
+
+	s := newSlotted(t)
+	s.w.conn = nil
+
+	h := headOf(s.call(1, 1, 0, true, 1000, 1, 2, 3))
+
+	if n := testing.AllocsPerRun(100, func() {
+		if _, _, err := s.w.Route(h, nil); err != nil {
+			t.Fatal(err)
+		}
+	}); n != 1 {
+		t.Errorf("routing a SEQUENCE COMPOUND allocates %v per call, want 1", n)
 	}
 }

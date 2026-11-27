@@ -295,10 +295,15 @@ func (r *replayStage) slotOf(hd recorded) (*Session, wire.Sequence, bool) {
 // lookupSlot answers the reply the slot keeps for hd's retry, as a fresh copy
 // with hd's transaction ID, or nothing: a new request, a request in flight, a
 // retry of an uncached reply and every error are answered by the SEQUENCE
-// member, from the slot's verdict.
+// member, from the slot's verdict, and so is a retry on a connection the
+// session is not bound to, under SP4_MACH_CRED, which the member refuses.
 func (r *replayStage) lookupSlot(
 	ctx context.Context, hd recorded, sess *Session, seq wire.Sequence,
 ) (*resources.Buf, error) {
+	if sess.Protect && r.bound != nil && !r.bound.Has(sess.ID) {
+		return nil, nil
+	}
+
 	if sess.Check(seq.Slot, seq.SeqID, callerKey(hd.(core.Header)), hd.record()) != SlotReplay {
 		return nil, nil
 	}
@@ -316,6 +321,13 @@ func (r *replayStage) lookupSlot(
 	buf, err := r.cache.pool.Get(ctx, addr, n)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
+			// Severed like a stored COMPOUND's resend in lookup: the delay
+			// answers nothing, and a request dropped with its connection
+			// left open is forbidden on TCP (RFC 7530 section 3.1.1).
+			if r.conn != nil {
+				r.conn.Close(ctx.Err())
+			}
+
 			return nil, &vfs.Delay{Cause: vfs.DelayResources}
 		}
 

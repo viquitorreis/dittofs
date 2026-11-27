@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cubbit/dittofs/internal/adapter/adaptertest"
 	"github.com/cubbit/dittofs/internal/adapter/adaptertest/nfsclient"
 	"github.com/cubbit/dittofs/internal/adapter/core"
 	"github.com/cubbit/dittofs/internal/adapter/nfs/protocol"
@@ -41,6 +42,7 @@ type replayShape struct {
 	t    *testing.T
 	mem  *memory.Service
 	ts   *protocol.Tables
+	reg  *protocol.Sessions // the node's sessions, which the protocol and its flows share
 	wrap func(core.Protocol) core.Protocol
 }
 
@@ -78,7 +80,8 @@ func replaying(
 
 	d := leakChecked(t)
 	mem := d.VFS.(*memory.Service)
-	ts := tables(handlers(d))
+	h := handlers(d)
+	ts := tables(h)
 
 	nfs3 := mutatingRow(mem)
 	nfs3.Cacheable = true
@@ -98,12 +101,15 @@ func replaying(
 
 	members.Ops[opAccess] = member
 
-	s := &replayShape{t: t, mem: mem, ts: &ts}
+	s := &replayShape{
+		t: t, mem: mem, ts: &ts,
+		reg: h.Sessions,
+	}
 	if shape != nil {
 		shape(s)
 	}
 
-	var p core.Protocol = protocol.New(ts, d.Budgets, nil)
+	var p core.Protocol = protocol.New(ts, d.Budgets, s.reg)
 	if s.wrap != nil {
 		p = s.wrap(p)
 	}
@@ -297,9 +303,11 @@ func nothingAnswers(t *testing.T, out <-chan doAnswer, name string) {
 	}
 }
 
-// inFlight is the adapter's requests admitted and not yet answered under
-// nfs3: a test's join, since a request drops its reply from the cache before
-// it ends, so the gauge returning to its baseline proves the drop already ran.
+// inFlight is the adapter's requests admitted and not yet answered, under every
+// protocol label: a COMPOUND is counted under nfs4 once it is routed, not under
+// the nfs3 label it was admitted with. A test's join, since a request drops its
+// reply from the cache before it ends, so the gauge returning to its baseline
+// proves the drop already ran.
 func inFlight(t *testing.T, m *metrics.Registry) float64 {
 	t.Helper()
 
@@ -320,11 +328,7 @@ func inFlight(t *testing.T, m *metrics.Registry) float64 {
 				continue
 			}
 
-			for _, lp := range mt.GetLabel() {
-				if lp.GetName() == "protocol" && lp.GetValue() == "nfs3" {
-					sum += mt.GetGauge().GetValue()
-				}
-			}
+			sum += mt.GetGauge().GetValue()
 		}
 	}
 
@@ -1311,6 +1315,10 @@ func TestAResentCompoundIsDroppedForAHeldReplyPool(t *testing.T) {
 func TestALaterMinorCompoundIsHandedToStoreThroughItsRows(t *testing.T) {
 	notes := new(replayNotes)
 	mem, _, srv := replaying(t, allVersions, func(s *replayShape) {
+		// The real SEQUENCE row holds its code: this test stands a row of its
+		// own in its place, to see what the pipeline does with a later minor.
+		delete(s.ts.V4.Ops[procCompound].Members.Ops, opSequence)
+
 		sequence := mutatingRow(s.mem)
 		sequence.Name = "sequence"
 		sequence.Versions = core.Range{First: 0, Last: 2}
@@ -1407,5 +1415,487 @@ func TestTheAuxiliaryProgramsAndAnUncacheableRowAreNeverCached(t *testing.T) {
 
 	if got := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3") - hits; got != 0 {
 		t.Errorf("the cache counted %v hits, want none", got)
+	}
+}
+
+// The levels a COMPOUND starts at (RFC 21 section 11.5): an NFSv4.1 compound is
+// negotiated but not in a session until its SEQUENCE has run, so a member that
+// needs a session is OP_NOT_IN_SESSION; an NFSv4.0 compound is at the session
+// level at once. A member that needs a tree, which no NFSv4 operation here
+// does, is the fault at the session level; before it, it lacks the session first.
+func TestACompoundStartsAtItsMinorVersionsLevel(t *testing.T) {
+	const (
+		needsSession = 60
+		needsTree    = 61
+		notInSession = 10071
+		fault        = 10006
+	)
+
+	_, _, srv := replaying(t, allVersions, func(s *replayShape) {
+		for code, needs := range map[uint32]core.Needs{
+			needsSession: core.NeedsSession,
+			needsTree:    core.NeedsTree,
+		} {
+			row := core.Row(0, "level", needs,
+				func(context.Context, *core.Request, void) (void, error) {
+					return void{}, nil
+				})
+			row.Versions = core.Range{First: 0, Last: 2}
+			s.member(code, row)
+		}
+	})
+	c := client(t, serving(t, srv))
+
+	for _, tc := range []struct {
+		name  string
+		minor uint32
+		code  uint32
+		want  uint32
+	}{
+		{"1 needing a session", 1, needsSession, notInSession},
+		{"0 needing a session", 0, needsSession, 0},
+		{"1 needing a tree", 1, needsTree, notInSession},
+		{"0 needing a tree", 0, needsTree, fault},
+	} {
+		rep, err := c.Do(within(t), compoundCall(tc.minor, tc.code))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// status, tag, count, then the member's code and status.
+		if got := binary.BigEndian.Uint32(rep.Body[16:]); got != tc.want {
+			t.Errorf("minor %s answered %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The core refusals no NFSv4 operation raises, a member that needs a
+// negotiation and one that needs a tree, have a row of their own that answers
+// the fault, so the answer is no unmapped error: the log and the metric would
+// call it a bug of the server otherwise.
+func TestTheCoreRefusalsNoNFSv4OperationRaisesHaveARow(t *testing.T) {
+	const fault = 10006
+
+	refusals := map[uint32]error{
+		63: core.ErrNotNegotiated,
+		64: core.ErrNoTree,
+	}
+
+	_, d, srv := replaying(t, allVersions, func(s *replayShape) {
+		for code, refusal := range refusals {
+			row := core.Row(0, "refusing", core.NeedsNothing,
+				func(context.Context, *core.Request, void) (void, error) {
+					return void{}, refusal
+				})
+			row.Versions = core.Range{First: 0, Last: 2}
+			s.member(code, row)
+		}
+	})
+	c := client(t, serving(t, srv))
+
+	for code, refusal := range refusals {
+		unmapped := recorded(t, d.Metrics, "adapter_unmapped_errors_total", "nfs4")
+
+		rep, err := c.Do(within(t), compoundCall(0, code))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// status, tag, count, then the member's code and status.
+		if got := binary.BigEndian.Uint32(rep.Body[16:]); got != fault {
+			t.Errorf("%v answered %d, want %d", refusal, got, fault)
+		}
+
+		got := recorded(t, d.Metrics, "adapter_unmapped_errors_total", "nfs4") - unmapped
+		if got != 0 {
+			t.Errorf("%v counted %v unmapped errors, want none: no row maps it", refusal, got)
+		}
+	}
+}
+
+// opAbandoning is the code of a member that waits for its request's context to
+// end, after a Create.
+const opAbandoning = 62
+
+// sessionCall is a COMPOUND of minor version 1 whose first operation is
+// SEQUENCE on sess at seq and slot, asking to cache its reply where cache is
+// set, followed by the free members ops.
+func sessionCall(
+	sess *protocol.Session, seq, slot uint32, cache bool, ops ...uint32,
+) nfsclient.Call {
+	var cached uint32
+	if cache {
+		cached = 1
+	}
+
+	call := nfsclient.Call{Prog: progNFS, Vers: 4, Proc: procCompound}
+
+	args := words(0, 1, uint32(1+len(ops)), opSequence)
+	args = append(args, sess.ID[:]...)
+	args = append(args, words(seq, slot, 0, cached)...)
+	call.Args = append(args, words(ops...)...)
+
+	return call
+}
+
+// sequenceStatus is the status the SEQUENCE a COMPOUND's reply opens with
+// answered: after the COMPOUND's status, its empty tag, the count of results
+// and SEQUENCE's code.
+func sequenceStatus(t *testing.T, rep nfsclient.Reply) uint32 {
+	t.Helper()
+
+	if len(rep.Body) < 20 {
+		t.Fatalf("the reply holds %d bytes, too few for a SEQUENCE result", len(rep.Body))
+	}
+
+	return binary.BigEndian.Uint32(rep.Body[16:])
+}
+
+// newSession is a session of two fore slots on the node's sessions.
+func newSession(t *testing.T, reg *protocol.Sessions) *protocol.Session {
+	t.Helper()
+
+	sess, err := reg.Create(1, protocol.Spec{Fore: protocol.Channel{
+		Slots: 2, MaxRequest: 1 << 20, MaxResponse: 1 << 20, MaxCached: 4096, MaxOps: 8,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { reg.End(sess.ID) })
+
+	return sess
+}
+
+// A SEQUENCE leaves its slot ready for the client's next sequence ID whether
+// its reply was cached or not: its row is cacheable, so core stores the reply
+// the slot keeps, and the next request is not out of order. A cached reply
+// resent on another connection is answered from the slot with no second run
+// (RFC 21 section 3.1).
+func TestASlotMovesOnAfterACachedAndAnUncachedSequence(t *testing.T) {
+	var reg *protocol.Sessions
+
+	mem, _, srv := replaying(t, allVersions, func(s *replayShape) { reg = s.reg })
+	sess := newSession(t, reg)
+	addr := serving(t, srv)
+	c1, c2 := client(t, addr), client(t, addr)
+
+	for seq := uint32(1); seq <= 2; seq++ {
+		// the first is a SEQUENCE alone, which no other member's cache covers.
+		ops := []uint32{}
+		if seq == 2 {
+			ops = append(ops, opAccess)
+		}
+
+		rep, err := c1.Do(within(t), sessionCall(sess, seq, 0, false, ops...))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got := sequenceStatus(t, rep); got != 0 {
+			t.Errorf("sequence %d answered %d, want NFS4_OK", seq, got)
+		}
+	}
+
+	xid := uint32(30)
+	call := sessionCall(sess, 3, 0, true, opAccess)
+	call.XID = &xid
+
+	first, err := c1.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := c2.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(first, second) {
+		t.Errorf("the resend was answered %+v, want the first's %+v", second, first)
+	}
+
+	wantCreates(t, "the three requests", mem, 2)
+
+	rep, err := c2.Do(within(t), sessionCall(sess, 4, 0, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := sequenceStatus(t, rep); got != 0 {
+		t.Errorf("the sequence after the cached one answered %d, want NFS4_OK", got)
+	}
+}
+
+// The resend of a cached SEQUENCE whose copy cannot take its charge from the
+// held reply pool closes its connection with nothing written, as the resend of
+// a stored v3 call does (RFC 7530 3.1.1: a server never drops a request and
+// leaves its TCP connection open); the resend once the pool frees is answered
+// the stored reply from the same slot.
+func TestAResentSequenceIsClosedForAHeldReplyPool(t *testing.T) {
+	var reg *protocol.Sessions
+
+	mem, d, srv := replaying(t, allVersions, func(s *replayShape) { reg = s.reg })
+	sess := newSession(t, reg)
+	addr := serving(t, srv)
+	c1 := client(t, addr)
+
+	xid := uint32(32)
+	call := sessionCall(sess, 1, 0, true, opAccess)
+	call.XID = &xid
+
+	first, err := c1.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	held, err := d.Budgets.Reply.Reserve(within(t), netip.Addr{}, 8<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c2 := client(t, addr)
+
+	rep, err := c2.Do(within(t), call)
+	if !errors.Is(err, io.EOF) {
+		t.Errorf("the resend answered %+v, %v while the reply pool was held, "+
+			"want its connection closed with nothing written", rep, err)
+	}
+
+	held.Release()
+
+	again, err := client(t, addr).Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(again, first) {
+		t.Errorf("the freed pool answered %+v, want the stored %+v", again, first)
+	}
+
+	wantCreates(t, "the resent sequence", mem, 1)
+}
+
+// A request whose connection closes while its member runs is still answered to
+// its slot: the reply is stored, so the resend on a new connection is the
+// stored reply, never a second Create, and the client's next sequence ID runs;
+// where the reply was not to be cached, the resend is RETRY_UNCACHED_REP, still
+// with one Create (RFC 21 section 3.1).
+func TestACompoundCancelledByItsConnectionIsStoredInItsSlot(t *testing.T) {
+	const retryUncached = 10068
+
+	for _, tc := range []struct {
+		name  string
+		cache bool
+		want  uint32 // the resend's second result where it is not the stored reply
+	}{
+		{"cached", true, 0},
+		{"uncached", false, retryUncached},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			started := make(chan struct{})
+
+			var reg *protocol.Sessions
+
+			mem, d, srv := replaying(t, allVersions, func(s *replayShape) {
+				row := abandonedRow(s.mem, started)
+				row.Versions = core.Range{First: 0, Last: 2}
+				s.member(opAbandoning, row)
+
+				reg = s.reg
+			})
+			sess := newSession(t, reg)
+			addr := serving(t, srv)
+			c1 := client(t, addr)
+			base := inFlight(t, d.Metrics)
+
+			xid := uint32(31)
+			call := sessionCall(sess, 1, 0, tc.cache, opAbandoning)
+			call.XID = &xid
+
+			ctx := within(t)
+			first := sendAsync(ctx, t, c1, call)
+
+			select {
+			case <-started:
+			case <-ctx.Done():
+				t.Fatal("the member never began")
+			}
+
+			if got := inFlight(t, d.Metrics); got != base+1 {
+				t.Fatalf("%v requests in flight while the member runs, want %v: "+
+					"the join cannot see a COMPOUND", got, base+1)
+			}
+
+			if err := c1.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			if got := <-first; got.err == nil {
+				t.Errorf("the abandoned call was answered %+v, want nothing", got.reply)
+			}
+
+			settled(t, d.Metrics, base)
+
+			c2 := client(t, addr)
+
+			rep, err := c2.Do(within(t), call)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got := sequenceStatus(t, rep); got != 0 {
+				t.Errorf("the resend's SEQUENCE answered %d, want NFS4_OK", got)
+			}
+
+			if !tc.cache {
+				if got := memberStatus(t, rep); got != tc.want {
+					t.Errorf("the resend's member answered %d, want %d", got, tc.want)
+				}
+			}
+
+			wantCreates(t, "the abandoned compound", mem, 1)
+
+			if !tc.cache {
+				return
+			}
+
+			rep, err = c2.Do(within(t), sessionCall(sess, 2, 0, false))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got := sequenceStatus(t, rep); got != 0 {
+				t.Errorf("the next sequence answered %d, want NFS4_OK", got)
+			}
+		})
+	}
+}
+
+// memberStatus is the status of the result that follows SEQUENCE's OK in a
+// COMPOUND's reply: SEQUENCE's result is 44 bytes after the COMPOUND's 12-byte
+// head, and the next result's code and status are the 8 after.
+func memberStatus(t *testing.T, rep nfsclient.Reply) uint32 {
+	t.Helper()
+
+	const at = 12 + 44
+
+	if len(rep.Body) < at+8 {
+		t.Fatalf("the reply holds %d bytes, too few for a second result", len(rep.Body))
+	}
+
+	return binary.BigEndian.Uint32(rep.Body[at+4:])
+}
+
+// The retry of a request whose reply was not kept is answered SEQUENCE's own
+// results with status NFS4_OK, then the member after it with
+// NFS4ERR_RETRY_UNCACHED_REP, and nothing runs again; an operation that is
+// illegal is answered NFS4ERR_OP_ILLEGAL, never RETRY_UNCACHED_REP; a request of
+// SEQUENCE alone is answered SEQUENCE's results, there being no member to
+// carry the error (RFC 8881 section 2.10.6.1.3). The slot is left as it was.
+func TestARetryOfAnUncachedRequestIsAnsweredSequenceOKThenRetryUncached(t *testing.T) {
+	const (
+		retryUncached = 10068
+		opIllegalCode = 10044
+		sequenceOnly  = 12 + 44
+	)
+
+	for _, tc := range []struct {
+		name    string
+		ops     []uint32
+		member  uint32 // the second result's status; unread when ops is empty
+		creates int
+	}{
+		{"SEQUENCE alone", nil, 0, 0},
+		{"a member that changes state", []uint32{opAccess}, retryUncached, 1},
+		{"an undefined operation", []uint32{0x7fff}, opIllegalCode, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reg *protocol.Sessions
+
+			mem, _, srv := replaying(t, allVersions, func(s *replayShape) { reg = s.reg })
+			sess := newSession(t, reg)
+			c := client(t, serving(t, srv))
+
+			xid := uint32(41)
+			call := sessionCall(sess, 1, 0, false, tc.ops...)
+			call.XID = &xid
+
+			if _, err := c.Do(within(t), call); err != nil {
+				t.Fatal(err)
+			}
+
+			rep, err := c.Do(within(t), call)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got := sequenceStatus(t, rep); got != 0 {
+				t.Fatalf("the resend's SEQUENCE answered %d, want NFS4_OK", got)
+			}
+
+			if len(tc.ops) == 0 {
+				if len(rep.Body) != sequenceOnly {
+					t.Fatalf("the resend of SEQUENCE alone holds %d bytes, want %d",
+						len(rep.Body), sequenceOnly)
+				}
+			} else if got := memberStatus(t, rep); got != tc.member {
+				t.Errorf("the resend's member answered %d, want %d", got, tc.member)
+			}
+
+			wantCreates(t, "the retried compound", mem, tc.creates)
+
+			next, err := c.Do(within(t), sessionCall(sess, 2, 0, false))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got := sequenceStatus(t, next); got != 0 {
+				t.Errorf("the next sequence answered %d, want NFS4_OK", got)
+			}
+		})
+	}
+}
+
+// A node built by New answers SEQUENCE on the session CREATE_SESSION made: the
+// slots and the handlers' sessions are one registry. Wired to none, no request
+// marks its slot and SEQUENCE answers NFS4ERR_DELAY for ever.
+func TestSequenceOverTheWireThroughNew(t *testing.T) {
+	adaptertest.CheckLeaks(t, nil)
+
+	d := adapter.Deps{
+		VFS:     memory.New(t),
+		Budgets: adaptertest.Budgets(),
+		Metrics: metrics.New("test", "test"),
+	}
+	srv := serve(t, d, nfsSettings(only4))
+	c := client(t, srv.Addrs()[adapter.Socket{Service: "nfs", Network: "tcp"}][0])
+
+	rep, err := c.Do(within(t), exchangeIDCall(t, 100))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cl := binary.BigEndian.Uint64(rep.Body[replyClientID:])
+	seq := binary.BigEndian.Uint32(rep.Body[replySeqID:])
+
+	rep, err = c.Do(within(t), createSessionCall(100, cl, seq))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var sess protocol.Session
+
+	copy(sess.ID[:], rep.Body[replySession:replySession+16])
+
+	for n := uint32(1); n <= 2; n++ {
+		rep, err = c.Do(within(t), sessionCall(&sess, n, 0, false))
+		if err != nil {
+			t.Fatalf("SEQUENCE %d: %v", n, err)
+		}
+
+		if got := sequenceStatus(t, rep); got != 0 {
+			t.Fatalf("SEQUENCE %d answered status %d, want NFS4_OK", n, got)
+		}
 	}
 }

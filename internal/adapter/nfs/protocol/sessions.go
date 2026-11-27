@@ -372,6 +372,15 @@ func (b *Bound) IDs() []SessionID {
 	return slices.Clone(b.ids)
 }
 
+// Has reports whether the connection is bound to the session id names.
+func (b *Bound) Has(id SessionID) bool {
+	b.mu.Lock()
+
+	defer b.mu.Unlock()
+
+	return slices.Contains(b.ids, id)
+}
+
 // drop takes id off the list.
 func (b *Bound) drop(id SessionID) {
 	b.mu.Lock()
