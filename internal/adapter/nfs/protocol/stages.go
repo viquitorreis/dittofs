@@ -306,6 +306,8 @@ func checkAuth(c wire.Call) (flavour uint32, sys wire.AuthSysParms, err error) {
 		// not serve and answers it as RFC 21 section 11.1 answers those.
 		// Withdrawn by that stage, which the deferral ledger's row "RPCSEC_GSS
 		// context table and window; NFSv4.1 slots and reply cache" brings.
+		// That stage's header must read SEQUENCE: with none, the slot is never
+		// marked and SEQUENCE answers DELAY for ever.
 		return 0, sys, errAuthCred
 	}
 	vflavour, vbody := c.Verifier()

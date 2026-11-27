@@ -53,6 +53,7 @@ func FuzzRecord(f *testing.F) {
 		f.Add(readGolden(f, name))
 	}
 	f.Add(overTheCapCall())
+	f.Add(framed(seqCall("", 1, 1, seqOp([16]byte{1}, 1, 0, 0, true))))
 	f.Fuzz(func(t *testing.T, b []byte) {
 		n, _, err := wire.Fragment(b)
 		if err != nil {
@@ -68,6 +69,15 @@ func FuzzRecord(f *testing.F) {
 		c, _ := wire.ParseCall(rec)
 		if c == nil {
 			return
+		}
+		// SEQUENCE fields are read only from a COMPOUND past minor version 0 whose
+		// arguments hold them: the tag length, the minor, the count, the code
+		// and 32 bytes.
+		if _, ok := c.Sequence(); ok {
+			if m, _ := c.MinorVersion(); m == 0 || len(c.Args()) < 48 {
+				t.Fatalf("sequence fields read from minor %d, %d bytes of arguments",
+					m, len(c.Args()))
+			}
 		}
 		r := wire.AppendAccepted(nil, c.XID(), wire.AcceptProgUnavail)
 		if len(r) < 8 || binary.BigEndian.Uint32(r) != c.XID() || binary.BigEndian.Uint32(r[4:]) != replyType {

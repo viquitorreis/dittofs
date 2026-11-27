@@ -177,6 +177,10 @@ func appendOpaque(dst, b []byte) []byte {
 // unwraps it, rather than failing to decode on its ciphertext. Its minor
 // version is therefore not known until the arguments are unwrapped. Overturned
 // if the header must route such a call by minor version before unwrap.
+//
+// A GSS call whose header does not read SEQUENCE has no marked slot: SEQUENCE
+// then answers DELAY for it for ever (ops/v4/sequence.go). The stage that
+// serves GSS must read SEQUENCE from the unwrapped arguments before Admit.
 func clearArgs(flavour uint32, body []byte) bool {
 	if flavour != AuthGSS {
 		return true
