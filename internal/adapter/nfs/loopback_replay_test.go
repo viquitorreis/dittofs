@@ -41,6 +41,7 @@ type replayShape struct {
 	t    *testing.T
 	mem  *memory.Service
 	ts   *protocol.Tables
+	d    *adapter.Deps // the budgets the server is built over, still changeable
 	wrap func(core.Protocol) core.Protocol
 }
 
@@ -98,7 +99,7 @@ func replaying(
 
 	members.Ops[opAccess] = member
 
-	s := &replayShape{t: t, mem: mem, ts: &ts}
+	s := &replayShape{t: t, mem: mem, ts: &ts, d: &d}
 	if shape != nil {
 		shape(s)
 	}
