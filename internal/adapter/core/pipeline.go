@@ -1108,7 +1108,6 @@ func (p *pipeline) finish(tr *track, h Header, tb *OpTable, errs *ErrorTable, op
 		return
 	}
 	p.lap(tr, stageEncode)
-	release()
 
 	if storedReply(tr, op, err, errs, s) {
 		p.st.Replay.Store(h, reply)
@@ -1117,6 +1116,10 @@ func (p *pipeline) finish(tr *track, h Header, tb *OpTable, errs *ErrorTable, op
 		// which a request the replay check refused never made (§4.7).
 		p.st.Replay.Drop(h)
 	}
+	// The place is released once the reply is kept, as RFC 20 §4.7 has it, so
+	// a retransmission that finds the place free finds the reply.
+	release()
+
 	var key uint64
 	if tb != nil && tb.Holds {
 		key = p.st.Hold.Key(h)

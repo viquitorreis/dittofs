@@ -277,13 +277,17 @@ func (p *pipeline) compound(tr *track, h Header, r *Request, tb *OpTable, row *O
 		// a member that ran has a Cacheable row, whatever the members after
 		// it answered
 		ranCacheable bool
+		// the connection's close cancelled the request after a member answered
+		cancelled bool
 	)
-	for _, m := range ms {
-		s, send, notFailure, ran, merr := p.member(tr, mts, mt.Errors, m, r, v, drained, &sum)
+
+	for i, m := range ms {
+		s, send, notFailure, ran, cut, merr := p.member(tr, mts, mt.Errors, m, r, v, drained, &sum)
 		if ran && m.op.Cacheable {
 			ranCacheable = true
 		}
-		if !send {
+
+		if !send && !cut {
 			p.unanswered(tr, h, tb, reply, merr, release)
 			return
 		}
@@ -296,11 +300,57 @@ func (p *pipeline) compound(tr *track, h Header, r *Request, tb *OpTable, row *O
 		}
 		sum.add(stageEncode, p.since(tr))
 		status, last, count = s, merr, count+1
-		if failed = s != 0 && !notFailure; failed {
+
+		failed = s != 0 && !notFailure
+
+		if cut {
+			// decision: a compound the close cancelled after this member
+			// answered is ended here, the member after it, if any, answered
+			// as the table maps a service's delay, so the reply is whole and
+			// its retransmission is answered it, never run again from its
+			// first member (RFC 20 §6.5). Overturned if a protocol's delay
+			// row may not answer a member that never ran. A member that failed
+			// ends the compound as it stands: no result follows it (RFC 8881
+			// section 16.2.3), and its status stays the compound's.
+			var more bool
+			if !failed {
+				if more = i+1 < len(ms); more {
+					code = ms[i+1].op.Code
+				} else {
+					more = err != nil
+				}
+			}
+
+			if more {
+				var next *Op
+				if i+1 < len(ms) {
+					next = ms[i+1].op
+				}
+
+				status, _, _ = mt.Errors.Map(vfs.ErrDelay, next, v)
+				if encErr := p.result(mt, reply, code, status, nil, v); encErr != nil {
+					reply.Release()
+					p.st.Replay.Drop(h)
+					release()
+					p.drop(tr, nil, stageFault(encErr))
+
+					return
+				}
+
+				count++
+			}
+
+			cancelled = true
+
+			break
+		}
+
+		if failed {
 			break
 		}
 	}
-	if err != nil && !failed {
+
+	if err != nil && !failed && !cancelled {
 		// The member that did not decode, or names a code the table lacks,
 		// once the members before it have run, counted where a request
 		// alone's would be: a code the table lacks at route, the rest at
@@ -335,14 +385,26 @@ func (p *pipeline) compound(tr *track, h Header, r *Request, tb *OpTable, row *O
 		p.drop(tr, nil, fmt.Errorf("%w: a compound's head of %d bytes rewritten as %d (%v)", errWiring, headLen, len(again.B), encErr))
 		return
 	}
-	release()
 	// The compound row's own Cacheable column is not read: the reply is kept
 	// where a member that ran has a Cacheable row, and never otherwise, so a
-	// compound of reads alone cannot turn the cache over (§4.7).
+	// compound of reads alone cannot turn the cache over (§4.7). The place is
+	// released after the store, so a retransmission that finds the place free
+	// finds the reply kept (§4.7).
 	if ranCacheable {
 		p.st.Replay.Store(h, reply)
 	} else {
 		p.st.Replay.Drop(h)
+	}
+
+	release()
+
+	if cancelled {
+		// Kept for the retransmission, sent to no one: the connection is
+		// gone (§6.5).
+		reply.Release()
+		p.end(tr, false, 0, 0, last)
+
+		return
 	}
 	var key uint64
 	if tb.Holds {
@@ -360,7 +422,8 @@ func (p *pipeline) compound(tr *track, h Header, r *Request, tb *OpTable, row *O
 // compound unanswered (RFC 20 §4.3): a results array cut short under a
 // success is malformed; and once the connection's close has cancelled the
 // request's context, whatever the member answered, so the compound is
-// dropped with no member after it run (RFC 20 §6.5). The close's own cancel
+// ended with no member after it run (RFC 20 §6.5), kept for its retry where
+// cut says the member answered whole. The close's own cancel
 // is mapped as no error. notFailure is a NotFailure row's status, past which
 // the compound runs its next member. ran says the member ran as the
 // duplicate-request cache counts it: its handler was called and answered no
@@ -370,7 +433,7 @@ func (p *pipeline) compound(tr *track, h Header, r *Request, tb *OpTable, row *O
 func (p *pipeline) member(
 	tr *track, mts *tableSeries, errs *ErrorTable, m member,
 	r *Request, v Version, drained error, sum *sums,
-) (s Status, send, notFailure, ran bool, err error) {
+) (s Status, send, notFailure, ran, cut bool, err error) {
 	var called bool
 	err = p.check(m.op, r)
 	sum.add(stageRoute, p.since(tr))
@@ -412,7 +475,11 @@ func (p *pipeline) member(
 
 	sum.add(stageMapError, p.since(tr))
 
-	return s, send && tr.ctx.Err() == nil, notFailure, ran, err
+	// cut: the member answered, its result is whole, and the close cancelled
+	// the request after it; the cancel itself is no answer.
+	cut = send && ran && tr.ctx.Err() != nil && !p.endedByClose(err)
+
+	return s, send && tr.ctx.Err() == nil, notFailure, ran, cut, err
 }
 
 // result encodes one member's result into reply: its head, then, where the
