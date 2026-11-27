@@ -466,8 +466,10 @@ func TestALookupAllocatesNothing(t *testing.T) {
 		t.Fatalf("the priming lookup answers %v with %v, want a plain miss", err, buf)
 	}
 
+	marked := headOf(call)
+
 	if n := testing.AllocsPerRun(100, func() {
-		buf, err := w.Lookup(context.Background(), headOf(call))
+		buf, err := w.Lookup(context.Background(), marked)
 		if buf != nil || !errors.Is(err, errReplaying) {
 			t.Fatalf("the marked call answers %v with %v, want the in-progress mark", err, buf)
 		}
@@ -497,8 +499,10 @@ func TestALookupAllocatesNothing(t *testing.T) {
 	cred := binary.BigEndian.AppendUint32(nil, 0) // a stamp, the least the shape needs
 	gss := nullCall(wire.ProgNFS, wire.VersNFS3, 0, wire.AuthGSS, cred, wire.AuthNone, nil, nil)
 
+	refused := headOf(gss)
+
 	if n := testing.AllocsPerRun(100, func() {
-		buf, err := w.Lookup(context.Background(), headOf(gss))
+		buf, err := w.Lookup(context.Background(), refused)
 		if buf != nil || err != nil {
 			t.Fatalf("the refused call answers %v with %v, want a plain miss", err, buf)
 		}
@@ -723,8 +727,10 @@ func TestAnUncacheableRowIsLookedUpNowhere(t *testing.T) {
 		t.Errorf("the uncacheable row leaves %d cached entries, want none", held)
 	}
 
+	uncacheable := headOf(read)
+
 	if n := testing.AllocsPerRun(100, func() {
-		if buf, err := w.Lookup(context.Background(), headOf(read)); buf != nil || err != nil {
+		if buf, err := w.Lookup(context.Background(), uncacheable); buf != nil || err != nil {
 			t.Fatalf("the uncacheable row answers %v with %v, want a plain miss", err, buf)
 		}
 	}); n != 0 {
@@ -834,7 +840,7 @@ func TestTheCacheHoldsSixtySecondsOfTheWriteMix(t *testing.T) {
 // from another call's bytes.
 func TestNewWiresTheOneCacheOverEveryConnection(t *testing.T) {
 	ts, _ := tables()
-	p := New(ts, &resources.Budgets{Reply: resources.NewWaitBudget("reply", 1<<20)})
+	p := New(ts, &resources.Budgets{Reply: resources.NewWaitBudget("reply", 1<<20)}, nil)
 	a, z := p.NewConn(nil), p.NewConn(nil)
 	ra, okA := a.Replay.(*replayStage)
 
@@ -845,7 +851,7 @@ func TestNewWiresTheOneCacheOverEveryConnection(t *testing.T) {
 	}
 
 	for _, none := range []*resources.Budgets{nil, {}} {
-		if st := New(ts, none).NewConn(nil); st.Replay != nil {
+		if st := New(ts, none, nil).NewConn(nil); st.Replay != nil {
 			t.Errorf("a cache built without a reply budget wires %v", st.Replay)
 		}
 	}

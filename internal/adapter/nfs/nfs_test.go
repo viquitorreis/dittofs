@@ -456,13 +456,13 @@ func golden(t *testing.T, name string) []byte {
 // under nfs4. A procedure is its structs and one core.Row line.
 func TestANullRowAnswersAsTheReferenceServer(t *testing.T) {
 	d := leakChecked(t)
-	v4 := core.NewOpTable(tables(d).V4.Errors, false,
+	v4 := core.NewOpTable(tables(handlers(d)).V4.Errors, false,
 		core.Row[void, void](0, "null", core.NeedsNothing,
 			func(context.Context, *core.Request, void) (void, error) { return void{}, nil }))
 	v4.Protocol = "nfs4"
 	srv, err := core.NewServer(d, nfsSettings(allVersions), core.Listener{
 		Services: []string{"nfs"}, Network: "tcp",
-		Protocol: protocol.New(protocol.Tables{V4: v4}, d.Budgets),
+		Protocol: protocol.New(protocol.Tables{V4: v4}, d.Budgets, nil),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -587,7 +587,7 @@ func TestEachTableMapsCoresRefusals(t *testing.T) {
 		compoundProc = 1
 	)
 
-	ts := tables(adapter.Deps{Budgets: adaptertest.Budgets()})
+	ts := tables(handlers(adapter.Deps{Budgets: adaptertest.Budgets()}))
 	members := ts.V4.Ops[compoundProc].Members
 	other := errors.New("an error no row names")
 	for _, tc := range []struct {

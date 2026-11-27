@@ -396,6 +396,8 @@ type Session struct {
 	MustEnforce []uint32
 	MustAllow   []uint32
 
+	tab slots // the fore channel's slots, under their own mutex
+
 	// Guarded by Sessions.mu.
 	ended  bool
 	conns  []*Bound
@@ -474,6 +476,7 @@ func (s *Sessions) Create(cl vfs.ClientID, sp Spec) (*Session, error) {
 	}
 
 	sess := &Session{
+		tab:         slots{s: make([]slot, fore.Slots)},
 		Client:      cl,
 		Fore:        fore,
 		BackAttrs:   back,

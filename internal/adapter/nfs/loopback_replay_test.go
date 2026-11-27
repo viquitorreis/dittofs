@@ -78,7 +78,7 @@ func replaying(
 
 	d := leakChecked(t)
 	mem := d.VFS.(*memory.Service)
-	ts := tables(d)
+	ts := tables(handlers(d))
 
 	nfs3 := mutatingRow(mem)
 	nfs3.Cacheable = true
@@ -103,7 +103,7 @@ func replaying(
 		shape(s)
 	}
 
-	var p core.Protocol = protocol.New(ts, d.Budgets)
+	var p core.Protocol = protocol.New(ts, d.Budgets, nil)
 	if s.wrap != nil {
 		p = s.wrap(p)
 	}

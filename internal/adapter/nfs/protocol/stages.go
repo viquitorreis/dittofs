@@ -51,6 +51,12 @@ type header struct{ rec *resources.Buf }
 
 func (h header) call() wire.Call { return wire.Call(h.rec.B) }
 
+// record is the buffer the call came in, which names the request that holds a
+// slot's mark (RFC 21 section 3.1).
+func (h header) record() *resources.Buf {
+	return h.rec
+}
+
 func (h header) Op() uint32 { return h.call().Procedure() }
 
 // Version is the call's version, but for NFS version 4: a COMPOUND's minor
@@ -82,7 +88,8 @@ type stage struct {
 	served      served
 	errs        *core.ErrorTable
 	conn        *core.Conn
-	bound       *Bound // the connection's sessions; nil without a connection
+	bound       *Bound    // the connection's sessions; nil without a connection
+	sessions    *Sessions // the node's sessions, which a SEQUENCE's slot is found in; nil: none
 	established atomic.Bool
 }
 
@@ -98,9 +105,10 @@ func (s *stage) Decode(rec *resources.Buf, _ int) (core.Header, error) {
 		return nil, err
 	}
 	if errors.Is(err, wire.ErrNotCall) {
-		return header{rec}, nil
+		return header{rec: rec}, nil
 	}
-	return header{rec}, err
+
+	return header{rec: rec}, err
 }
 
 // Encode writes the reply for s, the two high bits telling a program's status

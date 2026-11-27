@@ -24,15 +24,17 @@ type Protocol struct {
 	tables Tables
 	errs   *core.ErrorTable // the stages' error table, which every connection shares
 	cache  *replayCache     // the one duplicate-request cache every connection shares
+	reg    *Sessions        // the node's sessions, which the slots of a SEQUENCE belong to
 }
 
 // New is the protocol over t, which holds every table its router may return;
 // a connection serves each pair its settings' range names whose table t holds.
 // Its duplicate-request cache answers from the reply budget b hands, pooled
 // for the fresh copies a retransmission reads; with none the cache is not
-// built and no reply is ever answered from another call's bytes.
-func New(t Tables, b *resources.Budgets) *Protocol {
-	p := &Protocol{tables: t, errs: newErrors()}
+// built and no reply is ever answered from another call's bytes. reg is the
+// node's sessions, whose slots answer a SEQUENCE's retries; nil: none.
+func New(t Tables, b *resources.Budgets, reg *Sessions) *Protocol {
+	p := &Protocol{tables: t, errs: newErrors(), reg: reg}
 	if b != nil && b.Reply != nil {
 		p.cache = newReplayCache(resources.NewBufPool(b.Reply))
 	}
@@ -51,13 +53,13 @@ func (p *Protocol) Framer() core.Framer { return framer{} }
 // core's defaults; the replay stage is built over the connection's own
 // address and the shared cache, so one cache answers every connection.
 func (p *Protocol) NewConn(c *core.Conn) core.Stages {
-	s := &stage{errs: p.errs, conn: c}
+	s := &stage{errs: p.errs, conn: c, sessions: p.reg}
 	if c != nil {
 		s.served = newServed(c.Settings().(settings.NFS).Versions, p.tables)
 		s.bound = new(Bound)
 	}
 
-	st := core.Stages{Header: s, Router: s, Errors: p.errs, Protocol: "nfs3"}
+	st := core.Stages{Header: s, Router: s, Errors: p.errs, Protocol: "nfs3", Flow: NewFlow(p.reg)}
 	if p.cache != nil {
 		st.Replay = &replayStage{stage: s, cache: p.cache}
 	}

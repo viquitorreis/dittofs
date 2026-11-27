@@ -220,7 +220,7 @@ type replayStage struct {
 // refusals come before the map, so a retransmission answered RPC_MISMATCH or
 // AUTH_ERROR is refused its own answer again, never one the cache kept for
 // a call that ran.
-func (r *replayStage) retryOf(hd header) (retryIdentity, wire.Call, bool) {
+func (r *replayStage) retryOf(hd recorded) (retryIdentity, wire.Call, bool) {
 	c := hd.call()
 
 	if _, err := wire.ParseCall(c); errors.Is(err, wire.ErrNotCall) {
@@ -270,15 +270,82 @@ func (r *replayStage) retryOf(hd header) (retryIdentity, wire.Call, bool) {
 	return retryIdentityOf(c, flavour, &sys, addr, replayTLS), c, true
 }
 
+// slotOf is the session and the SEQUENCE a call answered from its slot opens
+// with: a COMPOUND of minor version 1 or more, past the judgement Route makes
+// of its header, whose first operation is SEQUENCE on a session the node holds.
+func (r *replayStage) slotOf(hd recorded) (*Session, wire.Sequence, bool) {
+	c := hd.call()
+
+	_, err := wire.ParseCall(c)
+	if errors.Is(err, wire.ErrNotCall) || c.RPCVersion() != 2 || c.Program() != wire.ProgNFS {
+		return nil, wire.Sequence{}, false
+	}
+
+	if _, _, err := checkAuth(c); err != nil {
+		return nil, wire.Sequence{}, false
+	}
+
+	if minor, ok := c.MinorVersion(); !ok || !r.served.minor(core.Version(minor)) {
+		return nil, wire.Sequence{}, false
+	}
+
+	return sequenceOf(r.sessions, hd.(core.Header))
+}
+
+// lookupSlot answers the reply the slot keeps for hd's retry, as a fresh copy
+// with hd's transaction ID, or nothing: a new request, a request in flight, a
+// retry of an uncached reply and every error are answered by the SEQUENCE
+// member, from the slot's verdict.
+func (r *replayStage) lookupSlot(
+	ctx context.Context, hd recorded, sess *Session, seq wire.Sequence,
+) (*resources.Buf, error) {
+	if sess.Check(seq.Slot, seq.SeqID, callerKey(hd.(core.Header)), hd.record()) != SlotReplay {
+		return nil, nil
+	}
+
+	n, ok := sess.ReplyLen(seq.Slot, seq.SeqID)
+	if !ok {
+		return nil, nil
+	}
+
+	var addr netip.Addr
+	if r.conn != nil {
+		addr = r.conn.Remote()
+	}
+
+	buf, err := r.cache.pool.Get(ctx, addr, n)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, &vfs.Delay{Cause: vfs.DelayResources}
+		}
+
+		return nil, err
+	}
+
+	if buf.B, ok = sess.AppendReply(buf.B[:0], seq.Slot, seq.SeqID); !ok || len(buf.B) < 4 {
+		buf.Release()
+
+		return nil, nil
+	}
+
+	binary.BigEndian.PutUint32(buf.B, hd.call().XID())
+
+	return buf, nil
+}
+
 // lookup answers h's cached reply as a fresh copy, reserved from the reply
 // budget under ctx, whose deadline passing answers the resources delay the
 // pipeline waits behind; or no buffer and no error when none is cached
 // and the call just started, marking it in progress so a retransmission
 // running the same call twice is answered nothing.
 func (r *replayStage) Lookup(ctx context.Context, h core.Header) (*resources.Buf, error) {
-	hd, ok := h.(header)
+	hd, ok := h.(recorded)
 	if !ok {
 		return nil, errors.New("nfs: a replay lookup for a header of another protocol")
+	}
+
+	if sess, seq, ok := r.slotOf(hd); ok {
+		return r.lookupSlot(ctx, hd, sess, seq)
 	}
 
 	id, c, serve := r.retryOf(hd)
@@ -354,8 +421,14 @@ func (r *replayStage) Lookup(ctx context.Context, h core.Header) (*resources.Buf
 // with segments lent to it, whose mark it clears without keeping anything: the
 // copy holds reply.B alone, which such a reply would leave short of the message.
 func (r *replayStage) Store(h core.Header, reply *resources.Buf) {
-	hd, ok := h.(header)
+	hd, ok := h.(recorded)
 	if !ok {
+		return
+	}
+
+	if sess, seq, ok := r.slotOf(hd); ok {
+		sess.Commit(seq.Slot, hd.record(), reply.B, seq.CacheThis)
+
 		return
 	}
 
@@ -416,11 +489,12 @@ func (r *replayStage) Store(h core.Header, reply *resources.Buf) {
 // ends without one, so the mark cannot hold its retransmission answering
 // nothing forever.
 func (r *replayStage) Drop(h core.Header) {
-	hd, ok := h.(header)
+	hd, ok := h.(recorded)
 	if !ok {
 		return
 	}
 
+	// A slot's mark is cleared by the flow's release, not here.
 	id, c, serve := r.retryOf(hd)
 
 	if !serve {
