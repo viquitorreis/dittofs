@@ -58,7 +58,7 @@ func mutating(t *testing.T, versions settings.VersionRange) (*memory.Service, ne
 	t.Helper()
 	d := leakChecked(t)
 	mem := d.VFS.(*memory.Service)
-	ts := tables(d)
+	ts := tables(handlers(d))
 	nfs3 := mutatingRow(mem)
 	nfs3.Versions = core.Range{First: 3, Last: 3} // NFSv3's request carries version 3
 	v3 := core.NewOpTable(ts.V3.Errors, false, nfs3)
@@ -80,7 +80,7 @@ func mutating(t *testing.T, versions settings.VersionRange) (*memory.Service, ne
 			"mount",
 			"nlm",
 			"nsm",
-		}, Network: "tcp", Protocol: protocol.New(ts),
+		}, Network: "tcp", Protocol: protocol.New(ts, d.Budgets, nil),
 	})
 	if err != nil {
 		t.Fatal(err)

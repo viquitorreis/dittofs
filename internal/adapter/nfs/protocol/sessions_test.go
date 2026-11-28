@@ -643,6 +643,30 @@ func TestSessionKeepsTheRecordsProtection(t *testing.T) {
 	}
 }
 
+// A connection bound twice to a session, as two SEQUENCEs of a fresh connection
+// in flight together do, is listed once: the list holds the session's ID once
+// and the fore channel counts the connection once, so the client's connection
+// count and each connection's session are right (RFC 8881 section 2.10.3.1).
+func TestBindIsIdempotent(t *testing.T) {
+	s, _ := registry(t, 8<<20)
+	sess := mustCreate(t, s, 1, Spec{Fore: ask(1, 4096, 0, 1)})
+
+	b := new(Bound)
+	for range 2 {
+		if !s.Bind(sess, b) {
+			t.Fatal("Bind of an open list was refused")
+		}
+	}
+
+	if got := b.IDs(); len(got) != 1 {
+		t.Errorf("the list holds %x, want the session once", got)
+	}
+
+	if got := s.Conns(sess); got != 1 {
+		t.Errorf("the fore channel holds %d connections, want 1", got)
+	}
+}
+
 // A connection's list takes the session's ID when it binds and not once it is
 // closed; a bind to an ended session binds nothing.
 func TestBindHonoursTheListsClose(t *testing.T) {
@@ -655,7 +679,7 @@ func TestBindHonoursTheListsClose(t *testing.T) {
 	}
 
 	closed := new(Bound)
-	closed.Close()
+	s.Unbound(closed)
 
 	if s.Bind(sess, closed) || len(closed.IDs()) != 0 {
 		t.Errorf("a closed list: Bind accepted or IDs %x, want nothing bound", closed.IDs())
@@ -704,5 +728,43 @@ func TestBackChannelBindUnbind(t *testing.T) {
 
 	if !b.Unbind(one) {
 		t.Error("Unbind of the last connection did not say last")
+	}
+}
+
+// A connection's close takes it off every session it was bound to, and the
+// list it leaves binds nothing after (RFC 21 section 3.4): a closed connection
+// held on a session would be kept, and counted, until the client's lease ends.
+func TestUnboundTakesTheConnectionOffItsSessions(t *testing.T) {
+	s, _ := registry(t, 8<<20)
+	one := mustCreate(t, s, 1, Spec{Fore: ask(1, 4096, 0, 1)})
+	two := mustCreate(t, s, 1, Spec{Fore: ask(1, 4096, 0, 1)})
+
+	gone, kept := new(Bound), new(Bound)
+
+	for _, sess := range []*Session{one, two} {
+		if !s.Bind(sess, gone) || !s.Bind(sess, kept) {
+			t.Fatal("Bind refused an open list")
+		}
+	}
+
+	s.Unbound(gone)
+
+	for _, sess := range []*Session{one, two} {
+		if got := s.Conns(sess); got != 1 {
+			t.Errorf("session %x holds %d connections after the close, want the one left open",
+				sess.ID, got)
+		}
+	}
+
+	if got := gone.IDs(); len(got) != 0 {
+		t.Errorf("the closed list holds %x, want none", got)
+	}
+
+	if s.Bind(one, gone) {
+		t.Error("Bind on the closed list was accepted")
+	}
+
+	if got := kept.IDs(); len(got) != 2 {
+		t.Errorf("the other connection holds %x, want both sessions", got)
 	}
 }

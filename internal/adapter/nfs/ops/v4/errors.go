@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/cubbit/dittofs/internal/adapter/core"
+	"github.com/cubbit/dittofs/internal/adapter/nfs/protocol"
 	"github.com/cubbit/dittofs/internal/adapter/nfs/wire"
 	"github.com/cubbit/dittofs/pkg/vfs"
 )
@@ -27,6 +28,17 @@ var (
 	errTooSmall      = errors.New("nfs4: a fore channel too small for a SEQUENCE reply")
 	errSeqMisordered = errors.New("nfs4: a CREATE_SESSION sequence out of order")
 	errAccess        = errors.New("nfs4: a caller that does not prove the machine")
+)
+
+// The refusals SEQUENCE answers that no service error stands for (RFC 8881
+// section 18.46.3 and section 15.1).
+var (
+	errBadSession   = errors.New("nfs4: a session this node does not hold")
+	errBadSlot      = errors.New("nfs4: a slot past the session's table")
+	errMisordered   = errors.New("nfs4: a sequence ID that is not the slot's next")
+	errFalseRetry   = errors.New("nfs4: a retry under another caller than the request it repeats")
+	errSequencePos  = errors.New("nfs4: SEQUENCE past the first operation")
+	errConnNotBound = errors.New("nfs4: a connection not bound to the session")
 )
 
 // minor40 is NFSv4.0 alone.
@@ -67,7 +79,10 @@ func compoundErrors() *core.ErrorTable {
 // operation: arguments that do not decode NFS4ERR_BADXDR, an operation the
 // minor version defines and no row serves NFS4ERR_NOTSUPP, and one the minor
 // version does not define, by its row's Versions or by ILLEGAL,
-// NFS4ERR_OP_ILLEGAL; anything else the fault (RFC 21 section 11.5).
+// NFS4ERR_OP_ILLEGAL; a member that needs no session NFS4ERR_OP_NOT_IN_SESSION;
+// and one that needs a negotiation or a tree, which no NFSv4 operation here
+// does, the fault by a row of its own, so the fault is no unmapped error;
+// anything else the fault (RFC 21 section 11.5).
 func memberErrors() *core.ErrorTable {
 	return core.NewErrorTable(core.Status(wire.NFS4ErrServerFault),
 		core.ErrorRow{Err: core.ErrDecode, Status: core.Status(wire.NFS4ErrBadXDR)},
@@ -82,6 +97,18 @@ func memberErrors() *core.ErrorTable {
 		core.ErrorRow{Err: errTooSmall, Status: core.Status(wire.NFS4ErrTooSmall)},
 		core.ErrorRow{Err: errSeqMisordered, Status: core.Status(wire.NFS4ErrSeqMisordered)},
 		core.ErrorRow{Err: errAccess, Status: core.Status(wire.NFS4ErrAccess)},
+		core.ErrorRow{Err: errBadSession, Status: core.Status(wire.NFS4ErrBadSession)},
+		core.ErrorRow{Err: errBadSlot, Status: core.Status(wire.NFS4ErrBadSlot)},
+		core.ErrorRow{Err: errMisordered, Status: core.Status(wire.NFS4ErrSeqMisordered)},
+		core.ErrorRow{Err: errFalseRetry, Status: core.Status(wire.NFS4ErrSeqFalseRetry)},
+		core.ErrorRow{
+			Err: protocol.ErrRetryUncached, Status: core.Status(wire.NFS4ErrRetryUncachedRep),
+		},
+		core.ErrorRow{Err: errSequencePos, Status: core.Status(wire.NFS4ErrSequencePos)},
+		core.ErrorRow{Err: errConnNotBound, Status: core.Status(wire.NFS4ErrConnNotBound)},
+		core.ErrorRow{Err: core.ErrNoSession, Status: core.Status(wire.NFS4ErrOpNotInSession)},
+		core.ErrorRow{Err: core.ErrNotNegotiated, Status: core.Status(wire.NFS4ErrServerFault)},
+		core.ErrorRow{Err: core.ErrNoTree, Status: core.Status(wire.NFS4ErrServerFault)},
 		core.ErrorRow{
 			Err:    &vfs.StateError{Kind: vfs.StateStaleClient},
 			Status: core.Status(wire.NFS4ErrStaleClientID),

@@ -43,10 +43,17 @@ const (
 	NFS4ErrStaleClientID     uint32 = 10022 // NFS4ERR_STALE_CLIENTID
 	NFS4ErrBadXDR            uint32 = 10036 // NFS4ERR_BADXDR
 	NFS4ErrOpIllegal         uint32 = 10044 // NFS4ERR_OP_ILLEGAL
+	NFS4ErrBadSession        uint32 = 10052 // NFS4ERR_BADSESSION
+	NFS4ErrBadSlot           uint32 = 10053 // NFS4ERR_BADSLOT
+	NFS4ErrConnNotBound      uint32 = 10055 // NFS4ERR_CONN_NOT_BOUND_TO_SESSION
 	NFS4ErrSeqMisordered     uint32 = 10063 // NFS4ERR_SEQ_MISORDERED
+	NFS4ErrSequencePos       uint32 = 10064 // NFS4ERR_SEQUENCE_POS
 	NFS4ErrRepTooBig         uint32 = 10066 // NFS4ERR_REP_TOO_BIG
+	NFS4ErrRetryUncachedRep  uint32 = 10068 // NFS4ERR_RETRY_UNCACHED_REP
 	NFS4ErrTooManyOps        uint32 = 10070 // NFS4ERR_TOO_MANY_OPS
+	NFS4ErrOpNotInSession    uint32 = 10071 // NFS4ERR_OP_NOT_IN_SESSION
 	NFS4ErrClientIDBusy      uint32 = 10074 // NFS4ERR_CLIENTID_BUSY
+	NFS4ErrSeqFalseRetry     uint32 = 10076 // NFS4ERR_SEQ_FALSE_RETRY
 	NFS4ErrEncrAlgUnsupp     uint32 = 10079 // NFS4ERR_ENCR_ALG_UNSUPP
 )
 

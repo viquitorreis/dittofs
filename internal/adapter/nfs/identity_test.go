@@ -66,7 +66,7 @@ func recording(t *testing.T) (*recorder, netip.AddrPort) {
 	t.Helper()
 	d := leakChecked(t)
 	rc := new(recorder)
-	ts := tables(d)
+	ts := tables(handlers(d))
 	build := func(old *core.OpTable, ops ...*core.Op) *core.OpTable {
 		tab := core.NewOpTable(old.Errors, false, ops...)
 		tab.Protocol = "nfs3"
@@ -91,7 +91,7 @@ func recording(t *testing.T) (*recorder, netip.AddrPort) {
 			"mount",
 			"nlm",
 			"nsm",
-		}, Network: "tcp", Protocol: protocol.New(ts),
+		}, Network: "tcp", Protocol: protocol.New(ts, d.Budgets, nil),
 	})
 	if err != nil {
 		t.Fatal(err)

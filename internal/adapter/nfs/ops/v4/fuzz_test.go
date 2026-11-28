@@ -35,9 +35,14 @@ func seeds(f *testing.F, add func(b []byte)) {
 // the header's minor version, and its count is the word after that minor
 // version. The head it echoes carries wire.Call.Tag's tag. ILLEGAL's decoder
 // takes exactly the bytes the COMPOUND row leaves (RFC 20 section 5.4, RFC 21
-// section 11).
+// section 11). Where the call is of minor version 1 or more and the header
+// reads SEQUENCE's fields, the SEQUENCE row's decoder reads the same ones from
+// the bytes after the operation's code (RFC 21 section 3.1).
 func FuzzCompound(f *testing.F) {
 	seeds(f, func(b []byte) { f.Add(b) })
+	f.Add(sequenceSeed(1))
+	f.Add(sequenceSeed(0))
+
 	illegal := Table(&Handlers{}).Ops[wire.ProcCompound].Members.Ops[opIllegal]
 	f.Fuzz(func(t *testing.T, b []byte) {
 		c, err := wire.ParseCall(b)
@@ -74,6 +79,22 @@ func FuzzCompound(f *testing.F) {
 		}
 		if want := wire.AppendCompoundStatus(nil, wire.NFS4ErrOpIllegal, tag, 3); !bytes.Equal(out.B, want) {
 			t.Fatalf("the head echoes %x, the header's tag gives %x", out.B, want)
+		}
+
+		if seq, ok := c.Sequence(); ok {
+			// the count and SEQUENCE's code follow the minor version.
+			var got sequenceArgs
+
+			k, err := got.DecodeWire(args[at+8:], uint32(minor))
+			if err != nil || k != 32 {
+				t.Fatalf("the header reads SEQUENCE's fields, the decoder %d bytes (%v)", k, err)
+			}
+
+			if got.SessionID != seq.Session || got.SequenceID != seq.SeqID ||
+				got.SlotID != seq.Slot || got.HighestSlot != seq.HighestSlot ||
+				got.CacheThis != seq.CacheThis {
+				t.Fatalf("the header reads %+v, the decoder %+v", seq, got)
+			}
 		}
 		rest := args[n:]
 		if _, k, err := illegal.Decode(rest, core.Version(minor)); err != nil || k != len(rest) {
@@ -125,4 +146,16 @@ func FuzzCodec(f *testing.F) {
 			t.Fatalf("%T at %d: %+v encodes to %x, which reads back as %+v (%d of %d bytes, %v)", got, v, got, out.B, again, m, len(out.B), err)
 		}
 	})
+}
+
+// sequenceSeed is a call of one COMPOUND of minor version minor whose one
+// operation is SEQUENCE.
+func sequenceSeed(minor uint32) []byte {
+	args := words(0, minor, 1, opSequence)
+	args = append(args, make([]byte, 16)...)
+	args = append(args, words(1, 2, 3, 1)...)
+
+	head := words(1, 0, 2, wire.ProgNFS, wire.VersNFS4, wire.ProcCompound, 0, 0, 0, 0)
+
+	return append(head, args...)
 }

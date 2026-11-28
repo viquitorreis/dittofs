@@ -39,11 +39,14 @@ func New(d adapter.Deps, s settings.NFS) (*core.Server, error) {
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("nfs: %s required", strings.Join(missing, ", "))
 	}
+
+	h := handlers(d)
+
 	return core.NewServer(d, s, core.Listener{
 		Services: []string{"nfs", "mount", "nlm", "nsm"},
 		Network:  "tcp",
 		Port:     s.Port,
-		Protocol: protocol.New(tables(d)),
+		Protocol: protocol.New(tables(h), d.Budgets, h.Sessions),
 	})
 }
 
@@ -56,11 +59,14 @@ func New(d adapter.Deps, s settings.NFS) (*core.Server, error) {
 // RFC 20 section 2.5 lays out, since a new package needs a test that can fail
 // and a package holding an empty table alone has none. Each table moves to its
 // ops package with its first row.
-func tables(d adapter.Deps) protocol.Tables {
+//
+// The tables are built over the handlers h, whose sessions the protocol's slots
+// share: a caller holds h and gives the same value to protocol.New.
+func tables(h *v4.Handlers) protocol.Tables {
 	aux := errorTable(core.Status(wire.StatusAccept | wire.AcceptSystemErr))
 	return protocol.Tables{
 		V3:    table("nfs3", errorTable(core.Status(wire.NFS3ErrServerFault))),
-		V4:    v4.Table(handlers(d)),
+		V4:    v4.Table(h),
 		Mount: table("nfs3", aux),
 		NLM:   table("nfs3", aux),
 		NSM:   table("nfs3", aux),

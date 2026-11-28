@@ -1,0 +1,2239 @@
+package nfs
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"net/netip"
+	"reflect"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/cubbit/dittofs/internal/adapter/adaptertest"
+	"github.com/cubbit/dittofs/internal/adapter/adaptertest/nfsclient"
+	"github.com/cubbit/dittofs/internal/adapter/core"
+	"github.com/cubbit/dittofs/internal/adapter/nfs/protocol"
+	"github.com/cubbit/dittofs/pkg/adapter"
+	"github.com/cubbit/dittofs/pkg/adapter/settings"
+	"github.com/cubbit/dittofs/pkg/metrics"
+	"github.com/cubbit/dittofs/pkg/resources"
+	"github.com/cubbit/dittofs/pkg/vfs"
+	"github.com/cubbit/dittofs/pkg/vfs/vfstest/memory"
+)
+
+// The procedures the replay tests address beside NFSv3's NULL: NFSv4's one
+// procedure, RFC 7530 section 16.5's COMPOUND, with its members' free test
+// codes named for the members they hold: SEQUENCE and GETATTR of RFC 8881
+// section 18, and one that answers a delay, at a code no row of the members'
+// table holds.
+const (
+	procCompound = 1
+	opSequence   = 53
+	opGetattr    = 4
+	opDelay      = 999
+)
+
+// replayShape is what a replay test may change in the server it is given: its
+// tables, over the memory service the rows mutate, and the protocol it wraps.
+type replayShape struct {
+	t    *testing.T
+	mem  *memory.Service
+	ts   *protocol.Tables
+	reg  *protocol.Sessions // the node's sessions, which the protocol and its flows share
+	b    *resources.Budgets // the server's budgets, which a test may size before it starts
+	wrap func(core.Protocol) core.Protocol
+}
+
+// replace is a fresh table over old's errors and label holding rows, in the
+// place of old in the shape's tables.
+func (s *replayShape) replace(old *core.OpTable, rows ...*core.Op) *core.OpTable {
+	tab := core.NewOpTable(old.Errors, false, rows...)
+	tab.Protocol = old.Protocol
+
+	return tab
+}
+
+// member puts row at the compound members' code, refusing a code the table
+// already holds.
+func (s *replayShape) member(code uint32, row *core.Op) {
+	members := s.ts.V4.Ops[procCompound].Members
+	if _, taken := members.Ops[code]; taken {
+		s.t.Fatalf("the members' table holds a row at %d: pick a code no row holds", code)
+	}
+
+	row.Code = code
+	members.Ops[code] = row
+}
+
+// replaying serves the mutating server the replay tests send twice: NFSv3's
+// NULL and the COMPOUND's member at opAccess, each a cacheable row whose one
+// call is a Create, over the range versions, shaped by shape before it starts.
+// It returns the service whose Mutations the rows fill, the deps holding the
+// budgets and the metrics the tests read, and the server itself, whose nfs
+// address serving serves.
+func replaying(
+	t *testing.T, versions settings.VersionRange, shape func(*replayShape),
+) (*memory.Service, adapter.Deps, *core.Server) {
+	t.Helper()
+
+	d := leakChecked(t)
+	mem := d.VFS.(*memory.Service)
+	h := handlers(d)
+	ts := tables(h)
+
+	nfs3 := mutatingRow(mem)
+	nfs3.Cacheable = true
+	nfs3.Versions = core.Range{First: 3, Last: 3}
+	ts.V3 = core.NewOpTable(ts.V3.Errors, false, nfs3)
+	ts.V3.Protocol = "nfs3"
+
+	member := mutatingRow(mem)
+	member.Code, member.Name = opAccess, "access"
+	member.Cacheable = true
+	member.Versions = core.Range{First: 0, Last: 2}
+
+	members := ts.V4.Ops[procCompound].Members
+	if _, taken := members.Ops[opAccess]; taken {
+		t.Fatalf("the members' table holds a row at %d: pick a code no row holds", opAccess)
+	}
+
+	members.Ops[opAccess] = member
+
+	s := &replayShape{
+		t: t, mem: mem, ts: &ts,
+		reg: h.Sessions, b: d.Budgets,
+	}
+	if shape != nil {
+		shape(s)
+	}
+
+	var p core.Protocol = protocol.New(ts, d.Budgets, s.reg)
+	if s.wrap != nil {
+		p = s.wrap(p)
+	}
+
+	srv, err := core.NewServer(d, nfsSettings(versions), core.Listener{
+		Services: []string{
+			"nfs",
+			"mount",
+			"nlm",
+			"nsm",
+		}, Network: "tcp", Protocol: p,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start(t, srv)
+
+	return mem, d, srv
+}
+
+// serving is srv's nfs address over tcp.
+func serving(t *testing.T, srv *core.Server) netip.AddrPort {
+	t.Helper()
+
+	addrs := srv.Addrs()[adapter.Socket{Service: "nfs", Network: "tcp"}]
+	if len(addrs) == 0 {
+		t.Fatal("no address serves nfs over tcp")
+	}
+
+	return addrs[0]
+}
+
+// blockingRow is a cacheable mutating row whose call announces itself on
+// started and answers only once release closes, so a test holds its request
+// in progress and lets it go.
+func blockingRow(mem *memory.Service, started chan<- struct{}, release <-chan struct{}) *core.Op {
+	row := core.Row(0, "null", core.NeedsNothing,
+		func(ctx context.Context, r *core.Request, _ void) (void, error) {
+			_, _ = mem.Create(
+				ctx,
+				r.Call,
+				mem.Store.Root,
+				[]byte("f"),
+				vfs.CreateArgs{Kind: vfs.CreateRegular},
+			)
+
+			close(started)
+			<-release
+
+			return void{}, nil
+		})
+	row.Cacheable = true
+
+	return row
+}
+
+// abandonedRow is a cacheable mutating row that waits for its request's
+// context to end, so a test can abandon the request and watch the pipeline
+// drop it from the cache once the row returns.
+func abandonedRow(mem *memory.Service, started chan<- struct{}) *core.Op {
+	row := core.Row(0, "null", core.NeedsNothing,
+		func(ctx context.Context, r *core.Request, _ void) (void, error) {
+			_, _ = mem.Create(
+				ctx,
+				r.Call,
+				mem.Store.Root,
+				[]byte("f"),
+				vfs.CreateArgs{Kind: vfs.CreateRegular},
+			)
+
+			close(started)
+			<-ctx.Done()
+
+			return void{}, nil
+		})
+	row.Cacheable = true
+	row.Versions = core.Range{First: 3, Last: 3}
+
+	return row
+}
+
+// answeringRow is a cacheable mutating row whose first call returns first and
+// whose later ones run the Create, so a test sends the call twice and the
+// retransmission is answered the second call's success, never an error the
+// first call was answered and the cache kept.
+func answeringRow(mem *memory.Service, first error) *core.Op {
+	var calls int
+
+	row := core.Row(0, "null", core.NeedsNothing,
+		func(ctx context.Context, r *core.Request, _ void) (void, error) {
+			calls++
+			if calls == 1 {
+				return void{}, first
+			}
+
+			_, _ = mem.Create(
+				ctx,
+				r.Call,
+				mem.Store.Root,
+				[]byte("f"),
+				vfs.CreateArgs{Kind: vfs.CreateRegular},
+			)
+
+			return void{}, nil
+		})
+	row.Cacheable = true
+	row.Versions = core.Range{First: 3, Last: 3}
+
+	return row
+}
+
+// cacheable marks row one the duplicate-request cache serves.
+func cacheable(row *core.Op) *core.Op {
+	row.Cacheable = true
+
+	return row
+}
+
+// errorRow is a member row over the minor versions whose every call returns
+// err, so a compound running it answers a failure its table maps, having run
+// its members before it.
+func errorRow(name string, err error) *core.Op {
+	row := core.Row(0, name, core.NeedsNothing,
+		func(context.Context, *core.Request, void) (void, error) {
+			return void{}, err
+		})
+	row.Versions = core.Range{First: 0, Last: 2}
+
+	return row
+}
+
+// nullCall is one cacheable NFSv3 NULL.
+func nullCall() nfsclient.Call {
+	return nfsclient.Call{Prog: progNFS, Vers: 3, Proc: 0}
+}
+
+// compoundCall is one COMPOUND of minor version minor whose members are the
+// free codes ops, of the member rows the shape put there.
+func compoundCall(minor uint32, ops ...uint32) nfsclient.Call {
+	call := nfsclient.Call{Prog: progNFS, Vers: 4, Proc: procCompound}
+
+	call.Args = append(words(0, minor, uint32(len(ops))), words(ops...)...)
+
+	return call
+}
+
+// doAnswer is what one background call came back with, its reply or its
+// error, never a t method, so a negative wait can read it with a timeout.
+type doAnswer struct {
+	reply nfsclient.Reply
+	err   error
+}
+
+// sendAsync answers c.Do's result through a channel, its goroutine touching
+// nothing else, so a test's negative wait reads the answer with a timeout and
+// joins it after.
+func sendAsync(
+	ctx context.Context, t *testing.T, c *nfsclient.Client, call nfsclient.Call,
+) <-chan doAnswer {
+	t.Helper()
+
+	out := make(chan doAnswer, 1)
+
+	go func() {
+		reply, err := c.Do(ctx, call)
+		out <- doAnswer{reply: reply, err: err}
+	}()
+
+	return out
+}
+
+// nothingAnswers fails t unless the answer channel holds nothing for the
+// bounded wait it gives. It is the assertion where no clock can be injected
+// and no event exposed: the pool a copy of a cached reply is charged to waits
+// under the request's own context, whose 30 s attempt deadline no test shortens,
+// so a held pool's answer is that nothing is granted to it, and the wait names
+// that. A granted answer inside the wait fails the test instead.
+func nothingAnswers(t *testing.T, out <-chan doAnswer, name string) {
+	t.Helper()
+
+	select {
+	case got := <-out:
+		t.Fatalf(
+			"%s: answered %v, %v while the reply pool was held, want nothing",
+			name,
+			got.reply,
+			got.err,
+		)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// inFlight is the adapter's requests admitted and not yet answered, under every
+// protocol label: a COMPOUND is counted under nfs4 once it is routed, not under
+// the nfs3 label it was admitted with. A test's join, since a request drops its
+// reply from the cache before it ends, so the gauge returning to its baseline
+// proves the drop already ran.
+func inFlight(t *testing.T, m *metrics.Registry) float64 {
+	t.Helper()
+
+	mfs, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var sum float64
+
+	for _, mf := range mfs {
+		if mf.GetName() != "dittofs_adapter_requests_in_flight" {
+			continue
+		}
+
+		for _, mt := range mf.GetMetric() {
+			if mt.GetGauge() == nil {
+				continue
+			}
+
+			sum += mt.GetGauge().GetValue()
+		}
+	}
+
+	return sum
+}
+
+// refused is the count adapter_refusals_total records under a protocol and a
+// stage, which the negative waits read: a held pool's parked wait refuses
+// nothing, so the count staying put is part of the design's own answer.
+func refused(t *testing.T, m *metrics.Registry, protocol, stage string) float64 {
+	t.Helper()
+
+	mfs, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var sum float64
+
+	for _, mf := range mfs {
+		if mf.GetName() != "dittofs_adapter_refusals_total" {
+			continue
+		}
+
+		for _, mt := range mf.GetMetric() {
+			var pl, sl bool
+
+			for _, lp := range mt.GetLabel() {
+				if lp.GetName() == "protocol" && lp.GetValue() == protocol {
+					pl = true
+				}
+
+				if lp.GetName() == "stage" && lp.GetValue() == stage {
+					sl = true
+				}
+			}
+
+			if pl && sl {
+				sum += mt.GetCounter().GetValue()
+			}
+		}
+	}
+
+	return sum
+}
+
+// settled waits until the requests in flight return to base, polling their
+// gauge: the condition itself, its limit t.Context's child deadline, never a
+// fixed sleep.
+func settled(t *testing.T, m *metrics.Registry, base float64) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for inFlight(t, m) != base {
+		if time.Now().After(deadline) {
+			t.Fatalf("requests in flight stayed above %v, want the baseline back", base)
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// wantCreates fails t unless the service's Mutations record holds n Creates
+// and nothing else.
+func wantCreates(t *testing.T, name string, mem *memory.Service, n int) {
+	t.Helper()
+
+	ops := mem.Ops()
+	if len(ops) != n {
+		t.Errorf("%s: the service served %v, want %d Creates", name, ops, n)
+
+		return
+	}
+
+	for _, op := range ops {
+		if op != vfs.OpCreate {
+			t.Errorf("%s: the service served %v, want Creates alone", name, ops)
+		}
+	}
+}
+
+// replayNotes is what the recording wrapper took of the calls the pipeline
+// made to its cache, each call's name in the order it arrived.
+type replayNotes struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (n *replayNotes) note(name string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	n.calls = append(n.calls, name)
+}
+
+func (n *replayNotes) take() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	got := n.calls
+	n.calls = nil
+
+	return got
+}
+
+// recordingProtocol wraps the whole protocol so its NewConn can wrap the
+// replay stage it builds: each call the pipeline makes to the cache is
+// recorded and passed through, the recording kind the plan allows, since the
+// call reaching the cache is itself the requirement.
+type recordingProtocol struct {
+	core.Protocol
+	notes *replayNotes
+}
+
+// NewConn is the protocol's own, with the replay stage it built wrapped in
+// the recorder.
+func (p *recordingProtocol) NewConn(c *core.Conn) core.Stages {
+	st := p.Protocol.NewConn(c)
+	if st.Replay != nil {
+		st.Replay = recordingReplay{ReplayCache: st.Replay, notes: p.notes}
+	}
+
+	return st
+}
+
+// recordingReplay records each call it passes to the cache it wraps.
+type recordingReplay struct {
+	core.ReplayCache
+	notes *replayNotes
+}
+
+func (r recordingReplay) Lookup(
+	ctx context.Context, h core.Header,
+) (*resources.Buf, error) {
+	r.notes.note("lookup")
+
+	return r.ReplayCache.Lookup(ctx, h)
+}
+
+func (r recordingReplay) Store(h core.Header, reply *resources.Buf) {
+	r.notes.note("store")
+	r.ReplayCache.Store(h, reply)
+}
+
+func (r recordingReplay) Drop(h core.Header) {
+	r.notes.note("drop")
+	r.ReplayCache.Drop(h)
+}
+
+// A call retransmitted over another connection is answered the reply the
+// first got, once: the service sees one Create, the two replies are equal and
+// the hit the cache counted is exactly one.
+func TestACacheableReplyIsAnsweredToItsRetransmission(t *testing.T) {
+	mem, d, srv := replaying(t, allVersions, nil)
+	addr := serving(t, srv)
+	c1, c2 := client(t, addr), client(t, addr)
+
+	hits := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3")
+
+	xid := uint32(1)
+	call := nfsclient.Call{XID: &xid, Prog: progNFS, Vers: 3, Proc: 0}
+
+	first, err := c1.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := c2.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(first, second) {
+		t.Errorf("the retransmission was answered %+v, want the first's %+v", second, first)
+	}
+
+	wantCreates(t, "the retransmission", mem, 1)
+
+	if got := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3") - hits; got != 1 {
+		t.Errorf("the cache counted %v hits, want one", got)
+	}
+}
+
+// A COMPOUND whose one member is the cacheable row answers its retransmission
+// from the cache the same way: one Create, equal replies, one hit.
+func TestACompoundOfACacheableMemberIsAnsweredToItsRetransmission(t *testing.T) {
+	mem, d, srv := replaying(t, allVersions, nil)
+	addr := serving(t, srv)
+	c1, c2 := client(t, addr), client(t, addr)
+
+	hits := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3")
+
+	xid := uint32(2)
+	call := compoundCall(0, opAccess)
+	call.XID = &xid
+
+	first, err := c1.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := c2.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(first, second) {
+		t.Errorf("the retransmission was answered %+v, want the first's %+v", second, first)
+	}
+
+	wantCreates(t, "the retransmission", mem, 1)
+
+	if got := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3") - hits; got != 1 {
+		t.Errorf("the cache counted %v hits, want one", got)
+	}
+}
+
+// A COMPOUND whose member is not cacheable is never answered from the cache:
+// its retransmission runs again, the service seeing a second Create, and no
+// hit is counted.
+func TestACompoundOfAnUncacheableMemberIsNeverAnsweredFromTheCache(t *testing.T) {
+	mem, d, srv := replaying(t, allVersions, func(s *replayShape) {
+		s.ts.V4.Ops[procCompound].Members.Ops[opAccess].Cacheable = false
+	})
+	addr := serving(t, srv)
+	c1, c2 := client(t, addr), client(t, addr)
+
+	hits := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3")
+
+	xid := uint32(3)
+	call := compoundCall(0, opAccess)
+	call.XID = &xid
+
+	first, err := c1.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := c2.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(first, second) {
+		t.Errorf("the retransmission was answered %+v, want the first's %+v", second, first)
+	}
+
+	wantCreates(t, "the retransmission", mem, 2)
+
+	if got := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3") - hits; got != 0 {
+		t.Errorf("the cache counted %v hits, want none", got)
+	}
+}
+
+// A COMPOUND of NFSv4.1 is never answered from the NFSv4.0 cache this
+// subtask builds: its retransmission runs again, leaving a second Create, and
+// no hit is counted.
+func TestACompoundOfALaterMinorIsNeverAnsweredFromTheCache(t *testing.T) {
+	mem, d, srv := replaying(t, allVersions, nil)
+	addr := serving(t, srv)
+	c1, c2 := client(t, addr), client(t, addr)
+
+	hits := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3")
+
+	xid := uint32(4)
+	call := compoundCall(1, opAccess)
+	call.XID = &xid
+
+	first, err := c1.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := c2.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(first, second) {
+		t.Errorf("the retransmission was answered %+v, want the first's %+v", second, first)
+	}
+
+	wantCreates(t, "the retransmission", mem, 2)
+
+	if got := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3") - hits; got != 0 {
+		t.Errorf("the cache counted %v hits, want none", got)
+	}
+}
+
+// A retransmission from another address is another call: the cache never
+// names the connection, but its key names the client's address, so the second
+// send runs again, leaving a second Create, and counts no hit.
+func TestARetransmissionFromAnotherAddressIsAnotherCall(t *testing.T) {
+	mem, d, srv := replaying(t, allVersions, nil)
+	addr := serving(t, srv)
+
+	c1, err := nfsclient.DialFrom(within(t), netip.MustParseAddr("127.0.0.1"), addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		_ = c1.Close()
+	})
+
+	c2, err := nfsclient.DialFrom(within(t), netip.MustParseAddr("127.0.0.2"), addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		_ = c2.Close()
+	})
+
+	hits := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3")
+
+	xid := uint32(5)
+	call := nullCall()
+	call.XID = &xid
+
+	if _, err := c1.Do(within(t), call); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := c2.Do(within(t), call); err != nil {
+		t.Fatal(err)
+	}
+
+	wantCreates(t, "the other address", mem, 2)
+
+	if got := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3") - hits; got != 0 {
+		t.Errorf("the cache counted %v hits, want none", got)
+	}
+}
+
+// A retransmission of a call refused at its header or its credential is
+// refused its own answer again, never one the cache kept for a call that ran:
+// the refusals below never reach the cache's map, so both sends of each are
+// answered the same bytes and no hit is counted nor anything run.
+func TestARefusedRetransmissionIsRefusedAgain(t *testing.T) {
+	mem, d, srv := replaying(t, allVersions, nil)
+	c := dial(t, srv)
+
+	hits := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3")
+
+	// sys is AUTH_SYS claiming 17 groups, one past RFC 5531's 16.
+	sys := append(words(0), opaque(nil)...)
+	sys = append(sys, words(0, 0, 17)...)
+	sys = append(sys, make([]byte, 17*4)...)
+
+	rpcv3 := call(71, progNFS, 3, 0, none) // its RPC version patched, second send the same bytes.
+	binary.BigEndian.PutUint32(rpcv3[8:], 3)
+
+	seventeen := call(72, progNFS, 3, 0, append(words(authSys), opaque(sys)...))
+
+	// verf is AUTH_NONE's credential with a verifier of flavour AUTH_SYS and
+	// no body, refused AUTH_BADVERF by the credential check.
+	verf := append(words(73, 0, 2, progNFS, 3, 0), none...)
+	verf = append(verf, words(authSys, 0)...)
+
+	for _, tc := range []struct {
+		name string
+		call []byte
+		want []byte
+	}{
+		{
+			"an RPC version 3 call",
+			rpcv3,
+			words(71, 1, 1, rpcMismatch, 2, 2), // REPLY, MSG_DENIED, RPC_MISMATCH, versions 2 to 2
+		},
+		{
+			"an AUTH_SYS credential of 17 groups",
+			seventeen,
+			words(72, 1, 1, 1, authBadCred), // REPLY, MSG_DENIED, AUTH_ERROR
+		},
+		{
+			"an empty AUTH_SYS verifier",
+			verf,
+			words(73, 1, 1, 1, authBadVerf), // REPLY, MSG_DENIED, AUTH_ERROR
+		},
+	} {
+		first := ask(t, c, tc.call)
+		if !bytes.Equal(first, tc.want) {
+			t.Errorf("%s: answered %x, want %x", tc.name, first, tc.want)
+		}
+
+		second := ask(t, c, tc.call)
+		if !bytes.Equal(second, tc.want) {
+			t.Errorf(
+				"%s: the retransmission was refused %x, want the first's %x",
+				tc.name,
+				second,
+				tc.want,
+			)
+		}
+	}
+
+	if got := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3") - hits; got != 0 {
+		t.Errorf("the cache counted %v hits, want none", got)
+	}
+
+	wantCreates(t, "the refusals", mem, 0)
+}
+
+// A retransmission of a call still running answers nothing, in flight: the
+// second send gets no reply, nothing the server holds is unmapped, and once
+// the row is released the send after it is answered the stored reply.
+func TestARetransmissionOfARunningCallIsAnsweredNothing(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	mem, d, srv := replaying(t, allVersions, func(s *replayShape) {
+		row := blockingRow(s.mem, started, release)
+		row.Versions = core.Range{First: 3, Last: 3}
+		s.ts.V3 = s.replace(s.ts.V3, row)
+	})
+	addr := serving(t, srv)
+	c1, c2 := client(t, addr), client(t, addr)
+
+	hits := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3")
+	unmapped := recorded(t, d.Metrics, "adapter_unmapped_errors_total", "nfs3")
+
+	xid := uint32(7)
+	call := nullCall()
+	call.XID = &xid
+
+	first := sendAsync(within(t), t, c1, call)
+
+	<-started
+
+	// The retransmission is answered nothing for as long as the ctx below
+	// waits: a bounded wait, since no event and no injectable clock name a
+	// no-reply the design answers with silence.
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	t.Cleanup(cancel)
+
+	if _, err := c2.Do(ctx, call); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("the retransmission was answered %v, want nothing before its deadline", err)
+	}
+
+	close(release)
+
+	got := <-first
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+
+	third, err := c2.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(third, got.reply) {
+		t.Errorf(
+			"the send after the release was answered %+v, want the first's %+v",
+			third,
+			got.reply,
+		)
+	}
+
+	wantCreates(t, "the call in progress", mem, 1)
+
+	if got := recorded(t, d.Metrics, "adapter_unmapped_errors_total", "nfs3") - unmapped; got != 0 {
+		t.Errorf("the no-reply answer unmapped %v errors, want none", got)
+	}
+
+	if got := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3") - hits; got != 1 {
+		t.Errorf("the cache counted %v hits, want one", got)
+	}
+}
+
+// blockingEachRow is blockingRow whose started channel carries one signal a
+// run: a copy the cache wrongly admits runs the handler again, and the second
+// signal names it.
+func blockingEachRow(
+	mem *memory.Service, started chan<- struct{}, release <-chan struct{},
+) *core.Op {
+	row := core.Row(0, "null", core.NeedsNothing,
+		func(ctx context.Context, r *core.Request, _ void) (void, error) {
+			_, _ = mem.Create(
+				ctx,
+				r.Call,
+				mem.Store.Root,
+				[]byte("f"),
+				vfs.CreateArgs{Kind: vfs.CreateRegular},
+			)
+
+			started <- struct{}{}
+
+			<-release
+
+			return void{}, nil
+		})
+	row.Cacheable = true
+
+	return row
+}
+
+// The second retransmission of a call still running is answered nothing too:
+// a retransmission refused by the replay check ends clearing no mark, since
+// it made none, so the mark the running call left keeps answering its own
+// copies. Were the first retransmission's end to clear that mark, the second
+// would miss the cache and run the mutating handler again.
+func TestTheSecondRetransmissionOfARunningCallRunsNothing(t *testing.T) {
+	started := make(chan struct{}, 4)
+	release := make(chan struct{})
+	mem, _, srv := replaying(t, allVersions, func(s *replayShape) {
+		row := blockingEachRow(s.mem, started, release)
+		row.Versions = core.Range{First: 3, Last: 3}
+		s.ts.V3 = s.replace(s.ts.V3, row)
+	})
+	addr := serving(t, srv)
+	c1, c2, c3 := client(t, addr), client(t, addr), client(t, addr)
+
+	xid := uint32(21)
+	call := nullCall()
+	call.XID = &xid
+
+	first := sendAsync(within(t), t, c1, call)
+
+	<-started
+
+	for i, c := range []*nfsclient.Client{c2, c3} {
+		// Each retransmission is answered nothing for as long as its bounded
+		// ctx waits, as long as the release below stays closed: a bounded
+		// wait, since no event and no injectable clock name the silence.
+		ctx, cancel := context.WithTimeout(t.Context(), 400*time.Millisecond)
+		t.Cleanup(cancel)
+
+		name := [...]string{"first", "second"}[i]
+		if _, err := c.Do(ctx, call); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("the %s retransmission was answered %v, want nothing", name, err)
+		}
+	}
+
+	close(release)
+
+	if got := <-first; got.err != nil {
+		t.Fatal(got.err)
+	}
+
+	wantCreates(t, "the call still running under two retransmissions", mem, 1)
+}
+
+// The second retransmission of a COMPOUND still running closes its connection
+// too: the first retransmission's end leaves the mark the running compound
+// made, so the second meets the mark, not an empty cache, and never runs a
+// member again.
+func TestTheSecondRetransmissionOfARunningCompoundRunsNothing(t *testing.T) {
+	started := make(chan struct{}, 4)
+	release := make(chan struct{})
+	mem, _, srv := replaying(t, allVersions, func(s *replayShape) {
+		row := blockingEachRow(s.mem, started, release)
+		row.Code, row.Versions = opAccess, core.Range{First: 0, Last: 2}
+		s.ts.V4.Ops[procCompound].Members.Ops[opAccess] = row // in place of the builder's row
+	})
+	addr := serving(t, srv)
+	c1, c2, c3 := client(t, addr), client(t, addr), client(t, addr)
+
+	xid := uint32(22)
+	call := compoundCall(0, opAccess)
+	call.XID = &xid
+
+	first := sendAsync(within(t), t, c1, call)
+
+	<-started
+
+	for _, c := range []*nfsclient.Client{c2, c3} {
+		// The close of the refused retransmission's connection is an
+		// event, so within's hang guard serves both: the refusal comes
+		// back at once, and a rerun, which the mark the pipeline keeps
+		// never allows, holds to its deadline.
+		if _, err := c.Do(within(t), call); !errors.Is(err, io.EOF) {
+			t.Errorf(
+				"a retransmission was answered %v, want the connection closed with nothing written",
+				err,
+			)
+		}
+	}
+
+	close(release)
+
+	if got := <-first; got.err != nil {
+		t.Fatal(got.err)
+	}
+
+	wantCreates(t, "the compound still running under two retransmissions", mem, 1)
+}
+
+// A retransmission of a COMPOUND still running closes the connection it came
+// on, writing nothing (RFC 7530 section 3.1.1): a resend after the release, on
+// a new connection, is answered the stored reply.
+func TestARetransmissionOfARunningCompoundClosesItsConnection(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	mem, d, srv := replaying(t, allVersions, func(s *replayShape) {
+		row := blockingRow(s.mem, started, release)
+		row.Code, row.Versions = opAccess, core.Range{First: 0, Last: 2}
+		s.ts.V4.Ops[procCompound].Members.Ops[opAccess] = row // in place of the builder's row
+	})
+	addr := serving(t, srv)
+	c1, c2 := client(t, addr), client(t, addr)
+
+	hits := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3")
+
+	xid := uint32(8)
+	call := compoundCall(0, opAccess)
+	call.XID = &xid
+
+	first := sendAsync(within(t), t, c1, call)
+
+	<-started
+
+	if _, err := c2.Do(within(t), call); !errors.Is(err, io.EOF) {
+		t.Errorf(
+			"the retransmission answered %v, want its connection closed with nothing written",
+			err,
+		)
+	}
+
+	close(release)
+
+	got := <-first
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+
+	c3 := client(t, addr)
+
+	third, err := c3.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(third, got.reply) {
+		t.Errorf(
+			"the resend on a new connection was answered %+v, want the first's %+v",
+			third,
+			got.reply,
+		)
+	}
+
+	wantCreates(t, "the compound in progress", mem, 1)
+
+	if got := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3") - hits; got != 1 {
+		t.Errorf("the cache counted %v hits, want one", got)
+	}
+}
+
+// A request whose context the client's close cancelled runs again when its
+// call is retransmitted: nothing is left for it in the cache, not even the
+// mark, since the pipeline drops it once its handler answers, which the gauge
+// of the requests in flight returning to its baseline names.
+func TestARetransmissionOfAnAbandonedCallRunsAgain(t *testing.T) {
+	started := make(chan struct{})
+	mem, d, srv := replaying(t, allVersions, func(s *replayShape) {
+		s.ts.V3 = s.replace(s.ts.V3, abandonedRow(s.mem, started))
+	})
+	addr := serving(t, srv)
+	c1 := client(t, addr)
+
+	hits := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3")
+	base := inFlight(t, d.Metrics)
+
+	xid := uint32(9)
+	call := nullCall()
+	call.XID = &xid
+
+	first := sendAsync(within(t), t, c1, call)
+
+	<-started
+
+	if err := c1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := <-first; got.err == nil {
+		t.Errorf("the abandoned call was answered %+v, want nothing", got.reply)
+	}
+
+	settled(t, d.Metrics, base)
+
+	c2 := client(t, addr)
+	if _, err := c2.Do(within(t), call); err != nil {
+		t.Fatal(err)
+	}
+
+	wantCreates(t, "the abandoned call", mem, 2)
+
+	if got := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3") - hits; got != 0 {
+		t.Errorf("the cache counted %v hits, want none", got)
+	}
+}
+
+// A call a delay or a fault answered is never answered from the cache: the
+// retransmission runs, the service seeing its Create, and is answered the
+// second call's success, never the first call's stored error.
+func TestARetransmissionOfADelayOrAFaultRunsAgain(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		first error
+	}{
+		{"a delay", vfs.ErrDelay},
+		{"a fault", vfs.ErrIO},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mem, d, srv := replaying(t, allVersions, func(s *replayShape) {
+				s.ts.V3 = s.replace(s.ts.V3, answeringRow(s.mem, tc.first))
+			})
+			addr := serving(t, srv)
+			c := client(t, addr)
+
+			hits := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3")
+
+			xid := uint32(10)
+			call := nullCall()
+			call.XID = &xid
+
+			if _, err := c.Do(within(t), call); err != nil {
+				t.Fatal(err)
+			}
+
+			second, err := c.Do(within(t), call)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if want := (nfsclient.Reply{XID: xid}); !reflect.DeepEqual(second, want) {
+				t.Errorf(
+					"the retransmission was answered %+v, want the second run's %+v",
+					second,
+					want,
+				)
+			}
+
+			wantCreates(t, "the retransmission", mem, 1)
+
+			if got := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3") - hits; got != 0 {
+				t.Errorf("the cache counted %v hits, want none", got)
+			}
+		})
+	}
+}
+
+// A call the service delayed, whose row's NoReply answer leaves the client
+// with nothing, still ends in the cache: its own mark, the one its miss made,
+// is dropped, so the retransmission runs the call again and is answered the
+// second run's success, never held as a call still running.
+func TestARetransmissionOfACallTheServiceDelayedRunsAgain(t *testing.T) {
+	mem, _, srv := replaying(t, allVersions, func(s *replayShape) {
+		row := answeringRow(s.mem, &vfs.Delay{Cause: vfs.DelayResources})
+		tab := core.NewOpTable(core.NewErrorTable(core.Status(0x40000005),
+			core.ErrorRow{Err: core.ErrDecode, Status: 1},
+			core.ErrorRow{Err: &vfs.Delay{Cause: vfs.DelayResources}, NoReply: true}), false, row)
+		tab.Protocol = s.ts.V3.Protocol
+		s.ts.V3 = tab
+	})
+	addr := serving(t, srv)
+	c := client(t, addr)
+
+	xid := uint32(23)
+	call := nullCall()
+	call.XID = &xid
+
+	// The bounded wait is the assertion: a NoReply row names no event and
+	// no injectable clock names its silence.
+	ctx, cancel := context.WithTimeout(t.Context(), 400*time.Millisecond)
+	t.Cleanup(cancel)
+
+	if _, err := c.Do(ctx, call); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the delayed call was answered %v, want the NoReply silence", err)
+	}
+
+	second, err := c.Do(within(t), call)
+	if err != nil {
+		t.Errorf(
+			"the retransmission of a call the service delayed, answered %v, want it run again",
+			err,
+		)
+	}
+
+	if want := (nfsclient.Reply{XID: xid}); !reflect.DeepEqual(second, want) {
+		t.Errorf("the retransmission was answered %+v, want the second run's %+v", second, want)
+	}
+
+	wantCreates(t, "the retransmission of a call the service delayed", mem, 1)
+}
+
+// The same for a COMPOUND whose member the service delayed: the retransmission
+// would be answered only the connection's close were the unanswered request's
+// mark left behind, so it runs the member again and is answered the second
+// run's success.
+func TestARetransmissionOfACompoundTheServiceDelayedRunsAgain(t *testing.T) {
+	mem, _, srv := replaying(t, allVersions, func(s *replayShape) {
+		row := answeringRow(s.mem, &vfs.Delay{Cause: vfs.DelayResources})
+		row.Code, row.Name = opAccess, "access"
+		row.Versions = core.Range{First: 0, Last: 2}
+		members := s.ts.V4.Ops[procCompound].Members
+		// The table itself stays: NewOpTable fills none of a members'
+		// ReadOp or EncodeResult, which the builder sets after it.
+		members.Errors = core.NewErrorTable(core.Status(0x40000005),
+			core.ErrorRow{Err: core.ErrDecode, Status: 1},
+			core.ErrorRow{Err: &vfs.Delay{Cause: vfs.DelayResources}, NoReply: true})
+		members.Ops[opAccess] = row
+	})
+	addr := serving(t, srv)
+	c := client(t, addr)
+
+	xid := uint32(24)
+	call := compoundCall(0, opAccess)
+	call.XID = &xid
+
+	// The bounded wait is the assertion: a NoReply row names no event and
+	// no injectable clock names its silence.
+	ctx, cancel := context.WithTimeout(t.Context(), 400*time.Millisecond)
+	t.Cleanup(cancel)
+
+	if _, err := c.Do(ctx, call); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the delayed compound was answered %v, want the NoReply silence", err)
+	}
+
+	second, err := c.Do(within(t), call)
+	if err != nil {
+		t.Errorf(
+			"the retransmission of a compound the service delayed, answered %v, want it run again",
+			err,
+		)
+	}
+
+	if second.XID != xid {
+		t.Errorf(
+			"the retransmission was answered xid %d, want the second run's %d",
+			second.XID,
+			xid,
+		)
+	}
+
+	wantCreates(t, "the retransmission of a compound the service delayed", mem, 1)
+}
+
+// A retransmission whose copied reply has no room in the reply pool waits for
+// it rather than refuse: while the pool is held its client is answered
+// nothing and no refusal and no unmapped error is counted, and once the pool
+// is released the same send is answered the cached reply, byte for byte.
+func TestARetransmissionWaitsForTheReplyPoolItIsCharged(t *testing.T) {
+	mem, d, srv := replaying(t, allVersions, nil)
+	addr := serving(t, srv)
+	c1, c2 := client(t, addr), client(t, addr)
+
+	hits := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3")
+
+	xid := uint32(12)
+	call := nullCall()
+	call.XID = &xid
+
+	first, err := c1.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	held, err := d.Budgets.Reply.Reserve(within(t), netip.Addr{}, 8<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second := sendAsync(within(t), t, c2, call)
+	nothingAnswers(t, second, "the held pool")
+
+	if got := refused(t, d.Metrics, "nfs3", "replay_check"); got != 0 {
+		t.Errorf("the parked copy refused %v times, want none", got)
+	}
+
+	if got := recorded(t, d.Metrics, "adapter_unmapped_errors_total", "nfs3"); got != 0 {
+		t.Errorf("the parked copy unmapped %v errors, want none", got)
+	}
+
+	held.Release()
+
+	got := <-second
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+
+	if !reflect.DeepEqual(got.reply, first) {
+		t.Errorf("the released pool answered %+v, want the cached %+v", got.reply, first)
+	}
+
+	wantCreates(t, "the parked retransmission", mem, 1)
+
+	if got := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3") - hits; got != 1 {
+		t.Errorf("the cache counted %v hits, want one", got)
+	}
+}
+
+// A resend of a stored COMPOUND whose copy cannot take its charge from the
+// held reply pool is dropped silently, its connection closed with nothing
+// written (RFC 7530 3.1.1), where the retransmission of a call still running
+// was closed for its mark; the COMPOUND resent once the pool frees is
+// answered the cached reply.
+func TestAResentCompoundIsDroppedForAHeldReplyPool(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	mem, d, srv := replaying(t, allVersions, func(s *replayShape) {
+		row := blockingRow(s.mem, started, release)
+		row.Code, row.Versions = opAccess, core.Range{First: 0, Last: 2}
+		s.ts.V4.Ops[procCompound].Members.Ops[opAccess] = row // in place of the builder's row
+	})
+	addr := serving(t, srv)
+	c1, c2 := client(t, addr), client(t, addr)
+
+	hits := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3")
+
+	xid := uint32(13)
+	call := compoundCall(0, opAccess)
+	call.XID = &xid
+
+	first := sendAsync(within(t), t, c1, call)
+
+	<-started
+
+	if _, err := c2.Do(within(t), call); !errors.Is(err, io.EOF) {
+		t.Errorf(
+			"the retransmission answered %v, want its connection closed with nothing written",
+			err,
+		)
+	}
+
+	close(release)
+
+	got := <-first
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+
+	// The pool held below holds the whole budget, which fits now that the
+	// first call's reply reservation went back with its send. The copy of a
+	// compound that cannot take its charge is severed at once, nothing
+	// written (RFC 7530 3.1.1), and the close ends that probe by core's own
+	// design, so the cut itself is counted as no refusal.
+	held, err := d.Budgets.Reply.Reserve(within(t), netip.Addr{}, 8<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c3 := client(t, addr)
+	if _, err := c3.Do(within(t), call); !errors.Is(err, io.EOF) {
+		t.Errorf(
+			"the resend answered %v while the reply pool was held, want its "+
+				"connection closed with nothing written",
+			err,
+		)
+	}
+	// The one refusal counted at the replay check is c2's errReplaying, the
+	// call still running; c3's cut counts nothing, and its delay answers
+	// nothing: the connection is already closed.
+	if got := refused(t, d.Metrics, "nfs3", "replay_check"); got != 1 {
+		t.Errorf("the dropped resend refused %v times, want only c2's refusal counted", got)
+	}
+
+	held.Release()
+
+	c4 := client(t, addr)
+
+	again, err := c4.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(again, got.reply) {
+		t.Errorf("the freed pool answered %+v, want the cached %+v", again, got.reply)
+	}
+
+	wantCreates(t, "the resent compound", mem, 1)
+
+	if got := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3") - hits; got != 1 {
+		t.Errorf("the cache counted %v hits, want one", got)
+	}
+}
+
+// A COMPOUND of a later minor version reaches the cache through its SEQUENCE
+// row the way a 4.0 one does, never stored by this subtask's key but handed
+// to Store by core's member rule: the recording wrapper shows each compound
+// stored through its cacheable member and no drop after it, and the delay
+// member the second compound runs past does not turn it into one.
+func TestALaterMinorCompoundIsHandedToStoreThroughItsRows(t *testing.T) {
+	notes := new(replayNotes)
+	mem, _, srv := replaying(t, allVersions, func(s *replayShape) {
+		// The real SEQUENCE row holds its code: this test stands a row of its
+		// own in its place, to see what the pipeline does with a later minor.
+		delete(s.ts.V4.Ops[procCompound].Members.Ops, opSequence)
+
+		sequence := mutatingRow(s.mem)
+		sequence.Name = "sequence"
+		sequence.Versions = core.Range{First: 0, Last: 2}
+		s.member(opSequence, cacheable(sequence))
+		getattr := mutatingRow(s.mem)
+		getattr.Name = "getattr"
+		getattr.Versions = core.Range{First: 0, Last: 2}
+		s.member(opGetattr, getattr)
+		s.member(opDelay, errorRow("delay", vfs.ErrDelay))
+		s.wrap = func(p core.Protocol) core.Protocol {
+			return &recordingProtocol{Protocol: p, notes: notes}
+		}
+	})
+	addr := serving(t, srv)
+	c := client(t, addr)
+
+	xid := uint32(14)
+	call := compoundCall(1, opSequence, opGetattr)
+
+	call.XID = &xid
+	if _, err := c.Do(within(t), call); err != nil {
+		t.Fatal(err)
+	}
+
+	xid = 15
+	call = compoundCall(1, opSequence, opDelay)
+
+	call.XID = &xid
+	if _, err := c.Do(within(t), call); err != nil {
+		t.Fatal(err)
+	}
+
+	got := notes.take()
+
+	want := []string{"lookup", "store", "lookup", "store"}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("the pipeline called the cache %v, want %v, and no drop", got, want)
+	}
+
+	wantCreates(t, "the two compounds", mem, 3)
+}
+
+// MOUNT's, NLM's and NSM's calls, and an NFSv3 row that is not cacheable, are
+// never answered from the cache: each retransmission runs again, so every
+// program the adapter serves twice leaves two runs and no hit is counted.
+func TestTheAuxiliaryProgramsAndAnUncacheableRowAreNeverCached(t *testing.T) {
+	mem, d, srv := replaying(t, allVersions, func(s *replayShape) {
+		row := func(code uint32, name string, vers uint32) *core.Op {
+			op := mutatingRow(s.mem)
+			op.Code, op.Name = code, name
+			op.Cacheable = true
+			op.Versions = core.Range{First: vers, Last: vers}
+
+			return op
+		}
+		read := mutatingRow(s.mem)
+		read.Code, read.Name = 6, "read" // NFSv3's READ, left not cacheable
+		read.Versions = core.Range{First: 3, Last: 3}
+		null := row(0, "null", 3)
+		s.ts.V3 = s.replace(s.ts.V3, read, null)
+		// MOUNT's NULL sits at procedure 0, the number of the cacheable NFSv3
+		// row, so the test would show the cache answering a retransmission of
+		// another program the moment the program gate was gone.
+		s.ts.Mount = s.replace(s.ts.Mount, row(0, "mnt", 3))
+		s.ts.NLM = s.replace(s.ts.NLM, row(1, "test", 4))
+		s.ts.NSM = s.replace(s.ts.NSM, row(6, "sm_notify", 1))
+	})
+	addr := serving(t, srv)
+	c := client(t, addr)
+
+	hits := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3")
+
+	for _, tc := range []struct {
+		name string
+		call nfsclient.Call
+	}{
+		{"the NFSv3 READ row", nfsclient.Call{Prog: progNFS, Vers: 3, Proc: 6}},
+		{"MOUNT's NULL", nfsclient.Call{Prog: progMount, Vers: 3, Proc: 0}},
+		{"NLM's TEST", nfsclient.Call{Prog: progNLM, Vers: 4, Proc: 1}},
+		{"NSM's SM_NOTIFY", nfsclient.Call{Prog: progNSM, Vers: 1, Proc: 6}},
+	} {
+		xid := uint32(16)
+
+		tc.call.XID = &xid
+		for range 2 {
+			if _, err := c.Do(within(t), tc.call); err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+		}
+	}
+
+	wantCreates(t, "every program's retransmission", mem, 8)
+
+	if got := recorded(t, d.Metrics, "adapter_replay_hits_total", "nfs3") - hits; got != 0 {
+		t.Errorf("the cache counted %v hits, want none", got)
+	}
+}
+
+// The levels a COMPOUND starts at (RFC 21 section 11.5): an NFSv4.1 compound is
+// negotiated but not in a session until its SEQUENCE has run, so a member that
+// needs a session is OP_NOT_IN_SESSION; an NFSv4.0 compound is at the session
+// level at once. A member that needs a tree, which no NFSv4 operation here
+// does, is the fault at the session level; before it, it lacks the session first.
+func TestACompoundStartsAtItsMinorVersionsLevel(t *testing.T) {
+	const (
+		needsSession = 60
+		needsTree    = 61
+		notInSession = 10071
+		fault        = 10006
+	)
+
+	_, _, srv := replaying(t, allVersions, func(s *replayShape) {
+		for code, needs := range map[uint32]core.Needs{
+			needsSession: core.NeedsSession,
+			needsTree:    core.NeedsTree,
+		} {
+			row := core.Row(0, "level", needs,
+				func(context.Context, *core.Request, void) (void, error) {
+					return void{}, nil
+				})
+			row.Versions = core.Range{First: 0, Last: 2}
+			s.member(code, row)
+		}
+	})
+	c := client(t, serving(t, srv))
+
+	for _, tc := range []struct {
+		name  string
+		minor uint32
+		code  uint32
+		want  uint32
+	}{
+		{"1 needing a session", 1, needsSession, notInSession},
+		{"0 needing a session", 0, needsSession, 0},
+		{"1 needing a tree", 1, needsTree, notInSession},
+		{"0 needing a tree", 0, needsTree, fault},
+	} {
+		rep, err := c.Do(within(t), compoundCall(tc.minor, tc.code))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// status, tag, count, then the member's code and status.
+		if got := binary.BigEndian.Uint32(rep.Body[16:]); got != tc.want {
+			t.Errorf("minor %s answered %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The core refusals no NFSv4 operation raises, a member that needs a
+// negotiation and one that needs a tree, have a row of their own that answers
+// the fault, so the answer is no unmapped error: the log and the metric would
+// call it a bug of the server otherwise.
+func TestTheCoreRefusalsNoNFSv4OperationRaisesHaveARow(t *testing.T) {
+	const fault = 10006
+
+	refusals := map[uint32]error{
+		63: core.ErrNotNegotiated,
+		64: core.ErrNoTree,
+	}
+
+	_, d, srv := replaying(t, allVersions, func(s *replayShape) {
+		for code, refusal := range refusals {
+			row := core.Row(0, "refusing", core.NeedsNothing,
+				func(context.Context, *core.Request, void) (void, error) {
+					return void{}, refusal
+				})
+			row.Versions = core.Range{First: 0, Last: 2}
+			s.member(code, row)
+		}
+	})
+	c := client(t, serving(t, srv))
+
+	for code, refusal := range refusals {
+		unmapped := recorded(t, d.Metrics, "adapter_unmapped_errors_total", "nfs4")
+
+		rep, err := c.Do(within(t), compoundCall(0, code))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// status, tag, count, then the member's code and status.
+		if got := binary.BigEndian.Uint32(rep.Body[16:]); got != fault {
+			t.Errorf("%v answered %d, want %d", refusal, got, fault)
+		}
+
+		got := recorded(t, d.Metrics, "adapter_unmapped_errors_total", "nfs4") - unmapped
+		if got != 0 {
+			t.Errorf("%v counted %v unmapped errors, want none: no row maps it", refusal, got)
+		}
+	}
+}
+
+// opAbandoning is the code of a member that waits for its request's context to
+// end, after a Create.
+const opAbandoning = 62
+
+// sessionCall is a COMPOUND of minor version 1 whose first operation is
+// SEQUENCE on sess at seq and slot, asking to cache its reply where cache is
+// set, followed by the free members ops.
+func sessionCall(
+	sess *protocol.Session, seq, slot uint32, cache bool, ops ...uint32,
+) nfsclient.Call {
+	var cached uint32
+	if cache {
+		cached = 1
+	}
+
+	call := nfsclient.Call{Prog: progNFS, Vers: 4, Proc: procCompound}
+
+	args := words(0, 1, uint32(1+len(ops)), opSequence)
+	args = append(args, sess.ID[:]...)
+	args = append(args, words(seq, slot, 0, cached)...)
+	call.Args = append(args, words(ops...)...)
+
+	return call
+}
+
+// sequenceStatus is the status the SEQUENCE a COMPOUND's reply opens with
+// answered: after the COMPOUND's status, its empty tag, the count of results
+// and SEQUENCE's code.
+func sequenceStatus(t *testing.T, rep nfsclient.Reply) uint32 {
+	t.Helper()
+
+	if len(rep.Body) < 20 {
+		t.Fatalf("the reply holds %d bytes, too few for a SEQUENCE result", len(rep.Body))
+	}
+
+	return binary.BigEndian.Uint32(rep.Body[16:])
+}
+
+// newSession is a session of two fore slots on the node's sessions.
+func newSession(t *testing.T, reg *protocol.Sessions) *protocol.Session {
+	t.Helper()
+
+	return newSessionUnder(t, reg, false)
+}
+
+// newSessionUnder is newSession, whose client's record is SP4_MACH_CRED where
+// protect is set.
+func newSessionUnder(t *testing.T, reg *protocol.Sessions, protect bool) *protocol.Session {
+	t.Helper()
+
+	sess, err := reg.Create(1, protocol.Spec{Protect: protect, Fore: protocol.Channel{
+		Slots: 2, MaxRequest: 1 << 20, MaxResponse: 1 << 20, MaxCached: 4096, MaxOps: 8,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { reg.End(sess.ID) })
+
+	return sess
+}
+
+// A SEQUENCE leaves its slot ready for the client's next sequence ID whether
+// its reply was cached or not: its row is cacheable, so core stores the reply
+// the slot keeps, and the next request is not out of order. A cached reply
+// resent on another connection is answered from the slot with no second run
+// (RFC 21 section 3.1).
+func TestASlotMovesOnAfterACachedAndAnUncachedSequence(t *testing.T) {
+	var reg *protocol.Sessions
+
+	mem, _, srv := replaying(t, allVersions, func(s *replayShape) { reg = s.reg })
+	sess := newSession(t, reg)
+	addr := serving(t, srv)
+	c1, c2 := client(t, addr), client(t, addr)
+
+	for seq := uint32(1); seq <= 2; seq++ {
+		// the first is a SEQUENCE alone, which no other member's cache covers.
+		ops := []uint32{}
+		if seq == 2 {
+			ops = append(ops, opAccess)
+		}
+
+		rep, err := c1.Do(within(t), sessionCall(sess, seq, 0, false, ops...))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got := sequenceStatus(t, rep); got != 0 {
+			t.Errorf("sequence %d answered %d, want NFS4_OK", seq, got)
+		}
+	}
+
+	xid := uint32(30)
+	call := sessionCall(sess, 3, 0, true, opAccess)
+	call.XID = &xid
+
+	first, err := c1.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := c2.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(first, second) {
+		t.Errorf("the resend was answered %+v, want the first's %+v", second, first)
+	}
+
+	wantCreates(t, "the three requests", mem, 2)
+
+	rep, err := c2.Do(within(t), sessionCall(sess, 4, 0, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := sequenceStatus(t, rep); got != 0 {
+		t.Errorf("the sequence after the cached one answered %d, want NFS4_OK", got)
+	}
+}
+
+// The resend of a cached SEQUENCE whose copy cannot take its charge from the
+// held reply pool closes its connection with nothing written, as the resend of
+// a stored v3 call does (RFC 7530 3.1.1: a server never drops a request and
+// leaves its TCP connection open); the resend once the pool frees is answered
+// the stored reply from the same slot.
+func TestAResentSequenceIsClosedForAHeldReplyPool(t *testing.T) {
+	var reg *protocol.Sessions
+
+	mem, d, srv := replaying(t, allVersions, func(s *replayShape) { reg = s.reg })
+	sess := newSession(t, reg)
+	addr := serving(t, srv)
+	c1 := client(t, addr)
+
+	xid := uint32(32)
+	call := sessionCall(sess, 1, 0, true, opAccess)
+	call.XID = &xid
+
+	first, err := c1.Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	held, err := d.Budgets.Reply.Reserve(within(t), netip.Addr{}, 8<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c2 := client(t, addr)
+
+	rep, err := c2.Do(within(t), call)
+	if !errors.Is(err, io.EOF) {
+		t.Errorf("the resend answered %+v, %v while the reply pool was held, "+
+			"want its connection closed with nothing written", rep, err)
+	}
+
+	held.Release()
+
+	again, err := client(t, addr).Do(within(t), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(again, first) {
+		t.Errorf("the freed pool answered %+v, want the stored %+v", again, first)
+	}
+
+	wantCreates(t, "the resent sequence", mem, 1)
+}
+
+// A request whose connection closes while its member runs is still answered to
+// its slot: the reply is stored, so the resend on a new connection is the
+// stored reply, never a second Create, and the client's next sequence ID runs;
+// where the reply was not to be cached, the resend is RETRY_UNCACHED_REP, still
+// with one Create (RFC 21 section 3.1).
+func TestACompoundCancelledByItsConnectionIsStoredInItsSlot(t *testing.T) {
+	const retryUncached = 10068
+
+	for _, tc := range []struct {
+		name  string
+		cache bool
+		want  uint32 // the resend's second result where it is not the stored reply
+	}{
+		{"cached", true, 0},
+		{"uncached", false, retryUncached},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			started := make(chan struct{})
+
+			var reg *protocol.Sessions
+
+			mem, d, srv := replaying(t, allVersions, func(s *replayShape) {
+				row := abandonedRow(s.mem, started)
+				row.Versions = core.Range{First: 0, Last: 2}
+				s.member(opAbandoning, row)
+
+				reg = s.reg
+			})
+			sess := newSession(t, reg)
+			addr := serving(t, srv)
+			c1 := client(t, addr)
+			base := inFlight(t, d.Metrics)
+
+			xid := uint32(31)
+			call := sessionCall(sess, 1, 0, tc.cache, opAbandoning)
+			call.XID = &xid
+
+			ctx := within(t)
+			first := sendAsync(ctx, t, c1, call)
+
+			select {
+			case <-started:
+			case <-ctx.Done():
+				t.Fatal("the member never began")
+			}
+
+			if got := inFlight(t, d.Metrics); got != base+1 {
+				t.Fatalf("%v requests in flight while the member runs, want %v: "+
+					"the join cannot see a COMPOUND", got, base+1)
+			}
+
+			if err := c1.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			if got := <-first; got.err == nil {
+				t.Errorf("the abandoned call was answered %+v, want nothing", got.reply)
+			}
+
+			settled(t, d.Metrics, base)
+
+			c2 := client(t, addr)
+
+			rep, err := c2.Do(within(t), call)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got := sequenceStatus(t, rep); got != 0 {
+				t.Errorf("the resend's SEQUENCE answered %d, want NFS4_OK", got)
+			}
+
+			if !tc.cache {
+				if got := memberStatus(t, rep); got != tc.want {
+					t.Errorf("the resend's member answered %d, want %d", got, tc.want)
+				}
+			}
+
+			wantCreates(t, "the abandoned compound", mem, 1)
+
+			if !tc.cache {
+				return
+			}
+
+			rep, err = c2.Do(within(t), sessionCall(sess, 2, 0, false))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got := sequenceStatus(t, rep); got != 0 {
+				t.Errorf("the next sequence answered %d, want NFS4_OK", got)
+			}
+		})
+	}
+}
+
+// memberStatus is the status of the result that follows SEQUENCE's OK in a
+// COMPOUND's reply: SEQUENCE's result is 44 bytes after the COMPOUND's 12-byte
+// head, and the next result's code and status are the 8 after.
+func memberStatus(t *testing.T, rep nfsclient.Reply) uint32 {
+	t.Helper()
+
+	const at = 12 + 44
+
+	if len(rep.Body) < at+8 {
+		t.Fatalf("the reply holds %d bytes, too few for a second result", len(rep.Body))
+	}
+
+	return binary.BigEndian.Uint32(rep.Body[at+4:])
+}
+
+// The retry of a request whose reply was not kept is answered SEQUENCE's own
+// results with status NFS4_OK, then the member after it with
+// NFS4ERR_RETRY_UNCACHED_REP, and nothing runs again; an operation that is
+// illegal is answered NFS4ERR_OP_ILLEGAL, never RETRY_UNCACHED_REP; a request of
+// SEQUENCE alone is answered SEQUENCE's results, there being no member to
+// carry the error (RFC 8881 section 2.10.6.1.3). The slot is left as it was.
+func TestARetryOfAnUncachedRequestIsAnsweredSequenceOKThenRetryUncached(t *testing.T) {
+	const (
+		retryUncached = 10068
+		opIllegalCode = 10044
+		sequenceOnly  = 12 + 44
+	)
+
+	for _, tc := range []struct {
+		name    string
+		ops     []uint32
+		code    uint32 // the second result's operation code; unread when ops is empty
+		member  uint32 // the second result's status; unread when ops is empty
+		creates int
+	}{
+		{"SEQUENCE alone", nil, 0, 0, 0},
+		{"a member that changes state", []uint32{opAccess}, opAccess, retryUncached, 1},
+		{"an undefined operation", []uint32{0x7fff}, opIllegalCode, opIllegalCode, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reg *protocol.Sessions
+
+			mem, _, srv := replaying(t, allVersions, func(s *replayShape) { reg = s.reg })
+			sess := newSession(t, reg)
+			c := client(t, serving(t, srv))
+
+			xid := uint32(41)
+			call := sessionCall(sess, 1, 0, false, tc.ops...)
+			call.XID = &xid
+
+			if _, err := c.Do(within(t), call); err != nil {
+				t.Fatal(err)
+			}
+
+			rep, err := c.Do(within(t), call)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got := sequenceStatus(t, rep); got != 0 {
+				t.Fatalf("the resend's SEQUENCE answered %d, want NFS4_OK", got)
+			}
+
+			if len(tc.ops) == 0 {
+				if len(rep.Body) != sequenceOnly {
+					t.Fatalf("the resend of SEQUENCE alone holds %d bytes, want %d",
+						len(rep.Body), sequenceOnly)
+				}
+			} else {
+				if len(rep.Body) < sequenceOnly+4 {
+					t.Fatalf("the resend holds %d bytes, no second result after the %d of SEQUENCE",
+						len(rep.Body), sequenceOnly)
+				}
+
+				if got := binary.BigEndian.Uint32(rep.Body[sequenceOnly:]); got != tc.code {
+					t.Errorf("the resend's second result is for operation %d, want %d",
+						got, tc.code)
+				}
+
+				if got := memberStatus(t, rep); got != tc.member {
+					t.Errorf("the resend's member answered %d, want %d", got, tc.member)
+				}
+			}
+
+			wantCreates(t, "the retried compound", mem, tc.creates)
+
+			next, err := c.Do(within(t), sessionCall(sess, 2, 0, false))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got := sequenceStatus(t, next); got != 0 {
+				t.Errorf("the next sequence answered %d, want NFS4_OK", got)
+			}
+		})
+	}
+}
+
+// closingProtocol wraps the protocol so each connection's OnClose runs when its
+// first request is admitted: the close has begun, as it has for a request still
+// running when the teardown's grace ends, and the request that follows runs
+// beside it.
+type closingProtocol struct{ core.Protocol }
+
+func (p closingProtocol) NewConn(c *core.Conn) core.Stages {
+	st := p.Protocol.NewConn(c)
+	st.Flow = closingFlow{FlowControl: st.Flow, onClose: st.OnClose}
+
+	return st
+}
+
+// closingFlow runs onClose before its first Admit.
+type closingFlow struct {
+	core.FlowControl
+	onClose func(context.Context)
+}
+
+func (f closingFlow) Admit(ctx context.Context, h core.Header) (func(), error) {
+	f.onClose(ctx)
+
+	return f.FlowControl.Admit(ctx, h)
+}
+
+// A SEQUENCE that runs on a connection whose close has begun, its list closed,
+// binds nothing and is refused as not bound: the session never lists a
+// connection that is gone, which no close would take off it again, and the
+// refusal leaves the slot as it was (RFC 21 section 3.4).
+func TestASequenceOnAClosingConnectionBindsNothing(t *testing.T) {
+	const connNotBound = 10055
+
+	var reg *protocol.Sessions
+
+	_, _, srv := replaying(t, allVersions, func(s *replayShape) {
+		reg = s.reg
+		s.wrap = func(p core.Protocol) core.Protocol { return closingProtocol{p} }
+	})
+	sess := newSession(t, reg)
+	c := client(t, serving(t, srv))
+
+	rep, err := c.Do(within(t), sessionCall(sess, 1, 0, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := sequenceStatus(t, rep); got != connNotBound {
+		t.Errorf("SEQUENCE on the closing connection answered %d, want %d", got, connNotBound)
+	}
+
+	if got := reg.Conns(sess); got != 0 {
+		t.Errorf("the session lists %d connections, want none", got)
+	}
+
+	if st := sess.Check(0, 1, 0, nil); st != protocol.SlotNew {
+		t.Errorf("the slot says %v for the refused sequence ID, want %v", st, protocol.SlotNew)
+	}
+}
+
+// A SEQUENCE refused because its connection is not bound to a session whose
+// client's record is SP4_MACH_CRED leaves its slot as it was, though the reply
+// is stored: the slot's next check is a new request, where a slot that took the
+// refused sequence ID would answer the client's resend, once it binds, the same
+// refusal for ever (RFC 8881 section 2.10.6.1.2).
+func TestARefusedSequenceLeavesItsSlot(t *testing.T) {
+	const connNotBound = 10055
+
+	var reg *protocol.Sessions
+
+	_, _, srv := replaying(t, allVersions, func(s *replayShape) { reg = s.reg })
+	sess := newSessionUnder(t, reg, true)
+	c := client(t, serving(t, srv))
+
+	for range 2 {
+		rep, err := c.Do(within(t), sessionCall(sess, 1, 0, true))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got := sequenceStatus(t, rep); got != connNotBound {
+			t.Errorf("SEQUENCE on the unbound connection answered %d, want %d", got, connNotBound)
+		}
+
+		if st := sess.Check(0, 1, 0, nil); st != protocol.SlotNew {
+			t.Errorf("the slot says %v for the refused sequence ID, want %v", st, protocol.SlotNew)
+		}
+
+		if got := reg.Conns(sess); got != 0 {
+			t.Errorf("the refused SEQUENCE bound %d connections, want none", got)
+		}
+	}
+}
+
+// A SEQUENCE on a connection binds it to the session, and the connection's
+// close takes it off again: 64 connections bound and closed leave the fore
+// channel empty, where a closed connection kept on it would stay until the
+// client's lease ends (RFC 21 section 3.4).
+func TestAClosedConnectionLeavesItsSessionsForeChannel(t *testing.T) {
+	const conns = 64
+
+	var reg *protocol.Sessions
+
+	_, _, srv := replaying(t, allVersions, func(s *replayShape) {
+		reg = s.reg
+		// 64 connections hold their buffers.
+		s.b.Connection = resources.NewBudget("connection", 16<<20)
+	})
+	sess := newSession(t, reg)
+	addr := serving(t, srv)
+
+	clients := make([]*nfsclient.Client, conns)
+
+	for i := range clients {
+		clients[i] = client(t, addr)
+
+		rep, err := clients[i].Do(within(t), sessionCall(sess, uint32(i+1), 0, false))
+		if err != nil {
+			t.Fatalf("connection %d: %v", i, err)
+		}
+
+		if got := sequenceStatus(t, rep); got != 0 {
+			t.Fatalf("sequence %d answered %d, want NFS4_OK", i+1, got)
+		}
+	}
+
+	if got := reg.Conns(sess); got != conns {
+		t.Fatalf("the fore channel holds %d connections, want %d", got, conns)
+	}
+
+	for _, c := range clients {
+		if err := c.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for reg.Conns(sess) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the fore channel still holds %d connections after every close, want none",
+				reg.Conns(sess))
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestASlotBeyondTheTableIsRefusedWithoutHarm sends SEQUENCE with a slot ID the
+// session's table does not have, which a client may send (RFC 8881 section
+// 18.46.3 answers NFS4ERR_BADSLOT): the server must answer it and stay up, on a
+// bound connection and, under SP4_MACH_CRED, on an unbound one and on a
+// closing one, where the answer is NFS4ERR_CONN_NOT_BOUND_TO_SESSION and
+// slot 0 is left as it was.
+func TestASlotBeyondTheTableIsRefusedWithoutHarm(t *testing.T) {
+	const (
+		badSlot      = 10053
+		connNotBound = 10055
+	)
+
+	cases := []struct {
+		name    string
+		protect bool
+		closing bool
+		want    uint32
+	}{
+		{"bound", false, false, badSlot},
+		{"unbound under MACH_CRED", true, false, connNotBound},
+		{"closing", false, true, connNotBound},
+	}
+
+	for _, tc := range cases {
+		for _, slot := range []uint32{99, 0xFFFFFFFF} {
+			t.Run(fmt.Sprintf("%s/%#x", tc.name, slot), func(t *testing.T) {
+				var reg *protocol.Sessions
+
+				_, _, srv := replaying(t, allVersions, func(s *replayShape) {
+					reg = s.reg
+					if tc.closing {
+						s.wrap = func(p core.Protocol) core.Protocol { return closingProtocol{p} }
+					}
+				})
+				sess := newSessionUnder(t, reg, tc.protect)
+				c := client(t, serving(t, srv))
+
+				for range 2 {
+					rep, err := c.Do(within(t), sessionCall(sess, 1, slot, true))
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					if got := sequenceStatus(t, rep); got != tc.want {
+						t.Errorf("SEQUENCE on slot %#x answered %d, want %d", slot, got, tc.want)
+					}
+				}
+
+				if st := sess.Check(0, 1, 0, nil); st != protocol.SlotNew {
+					t.Errorf("slot 0 says %v after the refusals, want %v", st, protocol.SlotNew)
+				}
+			})
+		}
+	}
+}
+
+// TestSequenceIsServedWhileTheServerDrains runs the real v4 table under a
+// drain begun while a request still runs: SEQUENCE alone is served. It catches
+// a SEQUENCE row without the context role, which would make every request of a
+// draining session fail.
+func TestSequenceIsServedWhileTheServerDrains(t *testing.T) {
+	const opBlock = 59
+
+	entered, release := make(chan struct{}), make(chan struct{})
+
+	var once, released sync.Once
+
+	var reg *protocol.Sessions
+
+	_, _, srv := replaying(t, allVersions, func(s *replayShape) {
+		reg = s.reg
+		row := core.Row[void, void](opBlock, "block", core.NeedsNothing,
+			func(ctx context.Context, _ *core.Request, _ void) (void, error) {
+				once.Do(func() { close(entered) })
+
+				select {
+				case <-release:
+				case <-ctx.Done():
+				}
+
+				return void{}, nil
+			})
+		row.Versions = core.Range{First: 0, Last: 2}
+		s.member(opBlock, row)
+	})
+	sess := newSession(t, reg)
+	addr := serving(t, srv)
+	c, running := client(t, addr), client(t, addr)
+
+	go func() { _, _ = running.Do(context.Background(), sessionCall(sess, 1, 0, false, opBlock)) }()
+
+	// The running request is held until the end, so a t.Fatal below still
+	// frees it and lets Stop return.
+	defer released.Do(func() { close(release) })
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the blocking member never began")
+	}
+
+	stopped := make(chan error, 1)
+
+	go func() { stopped <- srv.Stop(context.Background()) }()
+
+	ctx := within(t)
+
+	for srv.Health().State != adapter.StateDraining {
+		select {
+		case <-ctx.Done():
+			t.Fatal("the server never began to drain")
+		case <-time.After(time.Millisecond):
+		}
+	}
+
+	rep, err := c.Do(ctx, sessionCall(sess, 1, 1, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := sequenceStatus(t, rep); got != 0 {
+		t.Errorf("SEQUENCE under the drain answered %d, want NFS4_OK", got)
+	}
+
+	released.Do(func() { close(release) })
+
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestASecondSequenceInTheRetryOfAnUncachedRequestIsMisplaced pins what a
+// SEQUENCE after the first answers on the resend of a request whose reply was
+// not kept: its own NFS4ERR_SEQUENCE_POS, which RFC 8881 section 2.10.6.1.3
+// allows, and not RETRY_UNCACHED_REP.
+func TestASecondSequenceInTheRetryOfAnUncachedRequestIsMisplaced(t *testing.T) {
+	const sequencePos = 10064
+
+	var reg *protocol.Sessions
+
+	_, _, srv := replaying(t, allVersions, func(s *replayShape) { reg = s.reg })
+	sess := newSession(t, reg)
+	c := client(t, serving(t, srv))
+
+	call := sessionCall(sess, 1, 0, false)
+	binary.BigEndian.PutUint32(call.Args[8:], 2)
+	call.Args = append(call.Args, words(opSequence)...)
+	call.Args = append(call.Args, sess.ID[:]...)
+	call.Args = append(call.Args, words(1, 0, 0, 0)...)
+
+	xid := uint32(43)
+	call.XID = &xid
+
+	for i := range 2 {
+		rep, err := c.Do(within(t), call)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got := sequenceStatus(t, rep); got != 0 {
+			t.Errorf("send %d: SEQUENCE answered %d, want NFS4_OK", i, got)
+		}
+
+		if got := memberStatus(t, rep); got != sequencePos {
+			t.Errorf("send %d: the second SEQUENCE answered %d, want %d", i, got, sequencePos)
+		}
+	}
+}
+
+// A node built by New answers SEQUENCE on the session CREATE_SESSION made: the
+// slots and the handlers' sessions are one registry. Wired to none, no request
+// marks its slot and SEQUENCE answers NFS4ERR_DELAY for ever.
+func TestSequenceOverTheWireThroughNew(t *testing.T) {
+	adaptertest.CheckLeaks(t, nil)
+
+	d := adapter.Deps{
+		VFS:     memory.New(t),
+		Budgets: adaptertest.Budgets(),
+		Metrics: metrics.New("test", "test"),
+	}
+	srv := serve(t, d, nfsSettings(only4))
+	c := client(t, srv.Addrs()[adapter.Socket{Service: "nfs", Network: "tcp"}][0])
+
+	rep, err := c.Do(within(t), exchangeIDCall(t, 100))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cl := binary.BigEndian.Uint64(rep.Body[replyClientID:])
+	seq := binary.BigEndian.Uint32(rep.Body[replySeqID:])
+
+	rep, err = c.Do(within(t), createSessionCall(100, cl, seq))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var sess protocol.Session
+
+	copy(sess.ID[:], rep.Body[replySession:replySession+16])
+
+	for n := uint32(1); n <= 2; n++ {
+		rep, err = c.Do(within(t), sessionCall(&sess, n, 0, false))
+		if err != nil {
+			t.Fatalf("SEQUENCE %d: %v", n, err)
+		}
+
+		if got := sequenceStatus(t, rep); got != 0 {
+			t.Fatalf("SEQUENCE %d answered status %d, want NFS4_OK", n, got)
+		}
+	}
+}

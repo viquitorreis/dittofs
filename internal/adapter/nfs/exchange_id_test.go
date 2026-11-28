@@ -9,7 +9,6 @@ import (
 	"github.com/cubbit/dittofs/internal/adapter/adaptertest"
 	"github.com/cubbit/dittofs/internal/adapter/adaptertest/nfsclient"
 	"github.com/cubbit/dittofs/internal/adapter/core"
-	"github.com/cubbit/dittofs/internal/adapter/nfs/ops/v4"
 	"github.com/cubbit/dittofs/internal/adapter/nfs/protocol"
 	"github.com/cubbit/dittofs/pkg/adapter"
 	"github.com/cubbit/dittofs/pkg/vfs"
@@ -69,13 +68,12 @@ func TestExchangeIDOverTheWire(t *testing.T) {
 	// The proposals stay charged to the connection budget until the node's
 	// table drops them, so the test builds the server over handlers it keeps.
 	h := handlers(d)
-	ts := tables(d)
-	ts.V4 = v4.Table(h)
+	ts := tables(h)
 
 	srv, err := core.NewServer(d, nfsSettings(only4), core.Listener{
 		Services: []string{"nfs"},
 		Network:  "tcp",
-		Protocol: protocol.New(ts),
+		Protocol: protocol.New(ts, nil, h.Sessions),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -158,13 +156,12 @@ func TestLeaseExpiryDuringCreateSessionSendsTheLastDisconnect(t *testing.T) {
 	d.VFS = rn.Rec
 
 	h := handlers(d)
-	ts := tables(d)
-	ts.V4 = v4.Table(h)
+	ts := tables(h)
 
 	srv, err := core.NewServer(d, nfsSettings(only4), core.Listener{
 		Services: []string{"nfs"},
 		Network:  "tcp",
-		Protocol: protocol.New(ts),
+		Protocol: protocol.New(ts, nil, h.Sessions),
 	})
 	if err != nil {
 		t.Fatal(err)

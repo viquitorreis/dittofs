@@ -51,6 +51,12 @@ type header struct{ rec *resources.Buf }
 
 func (h header) call() wire.Call { return wire.Call(h.rec.B) }
 
+// record is the buffer the call came in, which names the request that holds a
+// slot's mark (RFC 21 section 3.1).
+func (h header) record() *resources.Buf {
+	return h.rec
+}
+
 func (h header) Op() uint32 { return h.call().Procedure() }
 
 // Version is the call's version, but for NFS version 4: a COMPOUND's minor
@@ -82,7 +88,8 @@ type stage struct {
 	served      served
 	errs        *core.ErrorTable
 	conn        *core.Conn
-	bound       *Bound // the connection's sessions; nil without a connection
+	bound       *Bound    // the connection's sessions; nil without a connection
+	sessions    *Sessions // the node's sessions, which a SEQUENCE's slot is found in; nil: none
 	established atomic.Bool
 }
 
@@ -98,9 +105,10 @@ func (s *stage) Decode(rec *resources.Buf, _ int) (core.Header, error) {
 		return nil, err
 	}
 	if errors.Is(err, wire.ErrNotCall) {
-		return header{rec}, nil
+		return header{rec: rec}, nil
 	}
-	return header{rec}, err
+
+	return header{rec: rec}, err
 }
 
 // Encode writes the reply for s, the two high bits telling a program's status
@@ -216,8 +224,13 @@ func (s *stage) Route(h core.Header, prev *core.Request) (*core.OpTable, *core.R
 		// until the compound's last member has run. Overturned if core ever
 		// releases a request before its compound's members finish with the
 		// state.
+		//
+		// decision: Route sets the level a compound starts at, from its minor
+		// version alone, so every member is judged against the same start and
+		// only the SEQUENCE member raises it (see compoundLevel). Overturned if
+		// the level must depend on the call's credential.
 		cr := &compoundRequest{
-			req: core.Request{Version: hd.Version(), Level: core.NeedsNothing, Conn: s.conn},
+			req: core.Request{Version: hd.Version(), Level: compoundLevel(minor), Conn: s.conn},
 		}
 		cr.req.State = &cr.state
 
@@ -225,6 +238,9 @@ func (s *stage) Route(h core.Header, prev *core.Request) (*core.OpTable, *core.R
 		if err := s.build(&cr.req, &cr.gids, flavour, parms, c); err != nil {
 			return nil, nil, err
 		}
+
+		s.sequence(&cr.req, &cr.state, hd)
+
 		return table, &cr.req, nil
 	}
 
@@ -236,6 +252,52 @@ func (s *stage) Route(h core.Header, prev *core.Request) (*core.OpTable, *core.R
 	}
 
 	return table, &r.req, nil
+}
+
+// compoundLevel is the level a COMPOUND of minor version minor starts at: an
+// NFSv4.0 call has no session to open and is at the session level; an NFSv4.1
+// call is negotiated, and reaches the session level through its SEQUENCE (RFC
+// 21 section 11.5).
+//
+// decision: an NFSv4.0 compound starts at the session level and an NFSv4.1 one
+// at the negotiated level, where its SEQUENCE raises it, so a member that needs
+// a session before SEQUENCE is refused NFS4ERR_OP_NOT_IN_SESSION; one that
+// needs a negotiation or a tree, which no NFSv4 row does, is the fault.
+// Overturned if an NFSv4 row needs a tree, or if NFSv4.0 gains a session.
+func compoundLevel(minor int) core.Needs {
+	if minor == 0 {
+		return core.NeedsSession
+	}
+
+	return core.NeedsNegotiated
+}
+
+// sequence reads what the SEQUENCE a COMPOUND of minor version 1 or more opens
+// with names, for that member to judge: the caller's key and the buffer that
+// holds the slot's mark, and, where the node holds the session, the call's
+// session and client (RFC 21 sections 3.1 and 11.5). A session the node does
+// not hold leaves them zero, which SEQUENCE answers BADSESSION.
+//
+// decision: the header reads SEQUENCE's fields, because the duplicate-request
+// lookup and the flow admit take only the header, and the SEQUENCE member alone
+// judges them and answers each sequence error as its own result, so the reply
+// carries SEQUENCE's result and never a status alone. Overturned if Lookup or
+// Admit are given the call's request in the header's place.
+func (s *stage) sequence(r *core.Request, st *State, hd header) {
+	seq, ok := hd.call().Sequence()
+	if !ok {
+		return
+	}
+
+	st.SeqFirst, st.SeqKey, st.SeqOwner = true, callerKey(hd), hd.rec
+
+	if s.sessions == nil {
+		return
+	}
+
+	if sess, ok := s.sessions.Get(seq.Session); ok {
+		r.Call.Session, r.Call.Client = sess.Ref, sess.Client
+	}
 }
 
 // callRequest is a call's request and the group list its Identity's claims
@@ -306,6 +368,8 @@ func checkAuth(c wire.Call) (flavour uint32, sys wire.AuthSysParms, err error) {
 		// not serve and answers it as RFC 21 section 11.1 answers those.
 		// Withdrawn by that stage, which the deferral ledger's row "RPCSEC_GSS
 		// context table and window; NFSv4.1 slots and reply cache" brings.
+		// That stage's header must read SEQUENCE: with none, the slot is never
+		// marked and SEQUENCE answers DELAY for ever.
 		return 0, sys, errAuthCred
 	}
 	vflavour, vbody := c.Verifier()
@@ -318,11 +382,25 @@ func checkAuth(c wire.Call) (flavour uint32, sys wire.AuthSysParms, err error) {
 
 // newErrors is the stages' error table: the refusals above, GARBAGE_ARGS for a
 // record that does not decode, and the fault for anything else (RFC 21 section
-// 11.5).
+// 11.5). The reply cache's two answers send nothing: a copy the reply budget
+// could not reserve, which the client retries, and a duplicate of a call still
+// running, which it retries once the first has ended.
+//
+// decision: the resources delay row maps every ErrDelay raised before Route,
+// which is where this table applies: core reads it only until Route finds the
+// program's table and then reads that table's own rows. A delay raised later
+// by a row's handler is answered by the fault status, since the program
+// tables have no delay row, and later delays of other stages inherit this row
+// only where they are raised before Route. An NFSv4 refusal before Route
+// that needs the same silence must close the connection as Lookup does,
+// since RFC 7530 section 3.1.1 forbids a silent drop on TCP. Overturned if a
+// delay of another cause needs an answer its cause does not choose.
 func newErrors() *core.ErrorTable {
 	return core.NewErrorTable(
 		core.Status(wire.StatusAccept|wire.AcceptSystemErr),
 		core.ErrorRow{Err: errNotCall, NoReply: true},
+		core.ErrorRow{Err: &vfs.Delay{Cause: vfs.DelayResources}, NoReply: true},
+		core.ErrorRow{Err: errReplaying, NoReply: true},
 		core.ErrorRow{Err: errRPCMismatch, Status: statusRPCMismatch},
 		core.ErrorRow{Err: errProgUnavail, Status: statusProgUnavail},
 		core.ErrorRow{Err: core.ErrVersion, Status: statusProgMismatch},

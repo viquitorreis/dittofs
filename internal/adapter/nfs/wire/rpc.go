@@ -34,6 +34,23 @@ type fields struct {
 	tagOK                          bool // its tag, read whole
 	minorOK                        bool // its minor version, read whole
 	credOK, verfOK                 bool // the credential and verifier, read whole
+	seq                            Sequence
+	seqOK                          bool // a COMPOUND of minor 1 or above opening with SEQUENCE
+}
+
+// OpSequence is SEQUENCE's operation code (RFC 8881 section 18.46).
+const OpSequence uint32 = 53
+
+// Sequence is a SEQUENCE operation's arguments, the first of a COMPOUND of
+// minor version 1 or above (RFC 8881 section 18.46.1): the session, the slot's sequence ID,
+// the slot, the highest slot the client uses and whether the reply is to be
+// kept.
+type Sequence struct {
+	Session     [16]byte
+	SeqID       uint32
+	Slot        uint32
+	HighestSlot uint32
+	CacheThis   bool
 }
 
 // Call is a parsed call: a view over the record's bytes that allocates nothing
@@ -116,8 +133,47 @@ func walk(c []byte) (fields, error) {
 			return f, fmt.Errorf("nfs/wire: %w: a COMPOUND's minor version", errPastRecord)
 		}
 		f.minorOK = true
+		f.seq, f.seqOK = readSequence(&r, f.minor)
 	}
 	return f, nil
+}
+
+// readSequence reads the head of a COMPOUND of minor version 1 or above: the operation
+// count, then SEQUENCE's operation code and arguments. A call that does not
+// open with SEQUENCE, or is cut inside it, reads none: the parse is not failed,
+// the router answers it (RFC 8881 section 18.46.3).
+func readSequence(r *reader, minor uint32) (s Sequence, ok bool) {
+	if minor == 0 {
+		return s, false
+	}
+
+	if n, ok := r.u32(); !ok || n == 0 {
+		return s, false
+	}
+
+	if op, ok := r.u32(); !ok || op != OpSequence {
+		return s, false
+	}
+	// A record cut inside the session ID fails the next read, past its end.
+	copy(s.Session[:], r.b[min(r.off, len(r.b)):])
+	r.off += 16
+
+	var a [4]uint32
+	for i := range a {
+		if a[i], ok = r.u32(); !ok {
+			return Sequence{}, false
+		}
+	}
+
+	// cachethis is an XDR bool: a word past 1 is no boolean, and the
+	// operation's decoder refuses it, so the head reads no SEQUENCE.
+	if a[3] > 1 {
+		return Sequence{}, false
+	}
+
+	s.SeqID, s.Slot, s.HighestSlot, s.CacheThis = a[0], a[1], a[2], a[3] == 1
+
+	return s, true
 }
 
 // isCompound reports whether f is an NFSv4 COMPOUND call, the only one whose
@@ -226,6 +282,14 @@ func (c Call) Tag() []byte {
 func (c Call) MinorVersion() (minor int, ok bool) {
 	f, _ := c.fields()
 	return int(f.minor), f.minorOK
+}
+
+// Sequence is the SEQUENCE arguments of a COMPOUND of minor version 1 or above; ok is false
+// for any other call, for one that does not open with SEQUENCE and for one
+// cut inside it.
+func (c Call) Sequence() (s Sequence, ok bool) {
+	f, _ := c.fields()
+	return f.seq, f.seqOK
 }
 
 // reader reads the record's big-endian fields, refusing each that does not lie
